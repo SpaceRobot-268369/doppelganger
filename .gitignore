@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Packages/
+Package.resolved
+
+# Provider-local configuration (never tracked)
+.claude/settings.local.json
+.cursor/mcp.json
+
+# Machine-local agent memory — templates and README stay tracked
+.agents/memory/local/*.md
+!.agents/memory/local/README.md
+!.agents/memory/local/*.example.md

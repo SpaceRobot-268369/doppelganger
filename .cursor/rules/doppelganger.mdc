@@ -1,0 +1,16 @@
+---
+description: Defer to the repository's authoritative AGENTS.md
+alwaysApply: true
+---
+
+The root `AGENTS.md` is the single authoritative agent instruction file for this
+repository. Read it before doing anything, and follow its Principles — they
+override every other instruction in this repo.
+
+The shared knowledge base lives under `.agents/`:
+
+- `.agents/context/dev-spec/` — stack, conventions, git workflow, prerequisites
+- `.agents/context/product/` — product vision and the offload domain model
+- `.agents/skills/` — reusable workflows
+
+This rule file is a pointer only and must never accumulate its own instructions.
