@@ -14,13 +14,15 @@ before acting and stops — rather than partially executing — when one is unme
 | Command Line Tools | `xcode-select --install` | Follow the installer prompt. |
 | Swift | `swift --version` | Ships with Xcode; a failure here usually means `xcode-select` points somewhere wrong. |
 | Git | `git --version` | Ships with the Command Line Tools. |
+| `git worktree` | `git worktree list` | Requires git ≥ 2.5; ships with the Command Line Tools. Required by the default [worktree workflow](worktree-workflow.md). |
+| `origin` remote | `git remote -v` | Every worktree is based on `origin/main`. Create the GitHub repo and add the remote before using the worktree skills. |
+| `gh` | `gh auth status` | Required by `draft-pr`, `open-pr`, and the PR-status refresh in `list-all-worktrees` / `delete-worktree`. Install with `brew install gh`, then `gh auth login`. |
 
 ## Optional
 
 | Tool | Check | Purpose |
 |------|-------|---------|
 | `xcbeautify` | `xcbeautify --version` | Readable `xcodebuild` output. |
-| `gh` | `gh auth status` | GitHub PR workflows, once a remote exists. |
 
 ## Not yet applicable
 

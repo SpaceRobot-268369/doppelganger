@@ -25,6 +25,11 @@ When the user wants to commit the current work.
 > [`../../context/dev-spec/prerequisites.md`](../../context/dev-spec/prerequisites.md),
 > then stop.
 
+> **Never commit from `doppelganger-main/`** (Principle 5). The main checkout is
+> read-only for authored tracked changes. If the current checkout is the main
+> one and it has tracked edits, stop and report it: the work belongs in a
+> worktree, and moving it there is the developer's call, not this skill's.
+
 ## Steps
 
 1. **Inspect (read-only):**
@@ -51,9 +56,16 @@ When the user wants to commit the current work.
    `CLAUDE.md`, tracked `.agents/` content, or provider adapters, confirm the
    change was already proposed and approved under Principle 1. If it was not,
    stop and surface it before going further.
-5. **Assess scope:** if the changes clearly span unrelated concerns, suggest
+5. **Check the worktree scope guard (Principle 6).** Read the active worktree's
+   recorded **Scope** from the canonical main-checkout
+   `.agents/memory/local/worktree-scopes.md`. If any staged path falls outside
+   it, stop and report the out-of-scope paths — the developer decides whether to
+   expand the recorded scope or move that work. Do not silently widen a scope,
+   and do not drop the offending files from the commit on your own initiative.
+   The guard is passive when the checkout has no registry entry.
+6. **Assess scope:** if the changes clearly span unrelated concerns, suggest
    splitting into multiple commits rather than one mixed commit.
-6. **Compose the message** (see format below) from the diff — describe what
+7. **Compose the message** (see format below) from the diff — describe what
    actually changed, not assumptions.
 
 ## Commit message format — Conventional Commits
