@@ -4,9 +4,14 @@ import SwiftUI
 struct DoppelgangerApp: App {
     var body: some Scene {
         Window("Doppelganger", id: "main") {
-            ContentView()
-                .frame(minWidth: 720, minHeight: 520)
+            MainView()
+                .frame(minWidth: 1000, minHeight: 620)
         }
         .windowResizability(.contentMinSize)
+        .windowStyle(.hiddenTitleBar)
+
+        Settings {
+            SettingsView()
+        }
     }
 }
