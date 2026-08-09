@@ -1,0 +1,242 @@
+import Foundation
+@testable import Doppelganger
+
+/// Decorates a real `FileSystemAccess` with injectable faults so the failure
+/// modes from `offload-model.md` can be produced deterministically against
+/// scratch fixtures: corrupted destination bytes, ENOSPC mid-copy, volumes
+/// vanishing mid-transfer, unreadable source files.
+final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
+    private let base: any FileSystemAccess
+    private let lock = NSLock()
+
+    // Failpoint state, lock-guarded.
+    private var corruptOnWriteSuffixes: Set<String> = []
+    private var noSpaceBudgets: [String: Int] = [:]        // root path → writable bytes before ENOSPC
+    private var goneRoots: Set<String> = []                // everything under these fails volumeGone
+    private var goneAfterReadBudgets: [String: Int] = [:]  // root path → readable bytes before the volume "vanishes"
+    private var goneAfterWriteBudgets: [String: Int] = [:] // root path → writable bytes before the volume "vanishes"
+    private var unreadableSuffixes: Set<String> = []
+    private var freeSpaceOverrides: [String: Int64] = [:]
+    private var readDelayMicros: UInt32 = 0
+    private var writeDelayMicros: UInt32 = 0
+
+    init(base: any FileSystemAccess) {
+        self.base = base
+    }
+
+    // MARK: - Test controls
+
+    /// Flip the first byte of the first chunk written to any path with this
+    /// suffix — produces a checksum mismatch on read-back at exactly one file.
+    func corruptFirstByteOnWrite(pathSuffix: String) {
+        withLock { corruptOnWriteSuffixes.insert(pathSuffix) }
+    }
+
+    /// Writes under `root` throw `.noSpace` once `bytes` have been written.
+    func failWithNoSpace(under root: URL, afterBytes bytes: Int) {
+        withLock { noSpaceBudgets[root.path] = bytes }
+    }
+
+    /// Everything under `root` immediately fails with `.volumeGone`, and
+    /// `fileExists` under it reports false — an unmounted volume.
+    func markVolumeGone(_ root: URL) {
+        withLock { _ = goneRoots.insert(root.path) }
+    }
+
+    /// The volume at `root` "vanishes" after `bytes` have been read under it.
+    func markVolumeGoneAfterReading(bytes: Int, under root: URL) {
+        withLock { goneAfterReadBudgets[root.path] = bytes }
+    }
+
+    /// The volume at `root` "vanishes" after `bytes` have been written under it.
+    func markVolumeGoneAfterWriting(bytes: Int, under root: URL) {
+        withLock { goneAfterWriteBudgets[root.path] = bytes }
+    }
+
+    /// Opening any path with this suffix for reading throws `.notReadable`.
+    func markUnreadable(pathSuffix: String) {
+        withLock { unreadableSuffixes.insert(pathSuffix) }
+    }
+
+    func overrideFreeSpace(at root: URL, bytes: Int64) {
+        withLock { freeSpaceOverrides[root.path] = bytes }
+    }
+
+    /// Slow every chunk down so cancellation tests have a deterministic
+    /// mid-transfer window to land in.
+    func delayReads(microseconds: UInt32) {
+        withLock { readDelayMicros = microseconds }
+    }
+
+    func delayWrites(microseconds: UInt32) {
+        withLock { writeDelayMicros = microseconds }
+    }
+
+    // MARK: - FileSystemAccess
+
+    func enumerate(root: URL) throws -> [SourceItem] {
+        if isGone(root.path) { throw FileSystemError.volumeGone }
+        return try base.enumerate(root: root)
+    }
+
+    func fileExists(at url: URL) -> Bool {
+        if isGone(url.path) { return false }
+        return base.fileExists(at: url)
+    }
+
+    func createDirectory(at url: URL) throws {
+        if isGone(url.path) { throw FileSystemError.volumeGone }
+        try base.createDirectory(at: url)
+    }
+
+    func openForReading(_ url: URL, uncached: Bool) throws -> any FileReadStream {
+        let path = url.path
+        if isGone(path) { throw FileSystemError.volumeGone }
+        if withLock({ unreadableSuffixes.contains { path.hasSuffix($0) } }) {
+            throw FileSystemError.notReadable(detail: "\(path): injected unreadable file")
+        }
+        return FailpointReadStream(base: try base.openForReading(url, uncached: uncached), path: path, owner: self)
+    }
+
+    func openForWritingExclusive(_ url: URL) throws -> any FileWriteStream {
+        let path = url.path
+        if isGone(path) { throw FileSystemError.volumeGone }
+        let corrupt = withLock { () -> Bool in
+            if let suffix = corruptOnWriteSuffixes.first(where: { path.hasSuffix($0) }) {
+                corruptOnWriteSuffixes.remove(suffix)
+                return true
+            }
+            return false
+        }
+        return FailpointWriteStream(
+            base: try base.openForWritingExclusive(url),
+            path: path,
+            owner: self,
+            corruptFirstByte: corrupt
+        )
+    }
+
+    func removeItem(at url: URL) throws {
+        if isGone(url.path) { throw FileSystemError.volumeGone }
+        try base.removeItem(at: url)
+    }
+
+    func freeSpace(at url: URL) throws -> Int64 {
+        if isGone(url.path) { throw FileSystemError.volumeGone }
+        if let override = withLock({ freeSpaceOverrides.first { url.path.hasPrefix($0.key) }?.value }) {
+            return override
+        }
+        return try base.freeSpace(at: url)
+    }
+
+    // MARK: - Stream callbacks
+
+    fileprivate func beforeRead(path: String) throws {
+        let delay = withLock { readDelayMicros }
+        if delay > 0 { usleep(delay) }
+        if isGone(path) { throw FileSystemError.volumeGone }
+    }
+
+    fileprivate func afterRead(path: String, count: Int) {
+        withLock {
+            for (root, budget) in goneAfterReadBudgets where covered(path, by: root) {
+                let remaining = budget - count
+                goneAfterReadBudgets[root] = remaining
+                if remaining <= 0 { goneRoots.insert(root) }
+            }
+        }
+    }
+
+    fileprivate func beforeWrite(path: String, count: Int) throws {
+        let delay = withLock { writeDelayMicros }
+        if delay > 0, count > 0 { usleep(delay) }
+        if isGone(path) { throw FileSystemError.volumeGone }
+        try withLock {
+            for (root, budget) in noSpaceBudgets where covered(path, by: root) {
+                if budget < count { throw FileSystemError.noSpace }
+                noSpaceBudgets[root] = budget - count
+            }
+        }
+    }
+
+    fileprivate func afterWrite(path: String, count: Int) {
+        withLock {
+            for (root, budget) in goneAfterWriteBudgets where covered(path, by: root) {
+                let remaining = budget - count
+                goneAfterWriteBudgets[root] = remaining
+                if remaining <= 0 { goneRoots.insert(root) }
+            }
+        }
+    }
+
+    // MARK: - Internals
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+
+    private func covered(_ path: String, by root: String) -> Bool {
+        path == root || path.hasPrefix(root + "/")
+    }
+
+    private func isGone(_ path: String) -> Bool {
+        withLock { goneRoots.contains { covered(path, by: $0) } }
+    }
+}
+
+private final class FailpointReadStream: FileReadStream {
+    private let base: any FileReadStream
+    private let path: String
+    private let owner: FailpointFileSystem
+
+    init(base: any FileReadStream, path: String, owner: FailpointFileSystem) {
+        self.base = base
+        self.path = path
+        self.owner = owner
+    }
+
+    func read(into buffer: inout [UInt8]) throws -> Int {
+        try owner.beforeRead(path: path)
+        let count = try base.read(into: &buffer)
+        owner.afterRead(path: path, count: count)
+        return count
+    }
+
+    func close() {
+        base.close()
+    }
+}
+
+private final class FailpointWriteStream: FileWriteStream {
+    private let base: any FileWriteStream
+    private let path: String
+    private let owner: FailpointFileSystem
+    private var corruptFirstByte: Bool
+
+    init(base: any FileWriteStream, path: String, owner: FailpointFileSystem, corruptFirstByte: Bool) {
+        self.base = base
+        self.path = path
+        self.owner = owner
+        self.corruptFirstByte = corruptFirstByte
+    }
+
+    func write(_ buffer: [UInt8], count: Int) throws {
+        try owner.beforeWrite(path: path, count: count)
+        if corruptFirstByte, count > 0 {
+            corruptFirstByte = false
+            var mutated = buffer
+            mutated[0] ^= 0xFF
+            try base.write(mutated, count: count)
+        } else {
+            try base.write(buffer, count: count)
+        }
+        owner.afterWrite(path: path, count: count)
+    }
+
+    func close() throws {
+        try owner.beforeWrite(path: path, count: 0)
+        try base.close()
+    }
+}
