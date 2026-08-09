@@ -11,5 +11,7 @@ public enum FileSystemError: Error, Sendable, Hashable {
     case notReadable(detail: String)
     /// Exclusive create found an existing file (EEXIST) — a name collision.
     case alreadyExists
+    /// A source item no longer matches the size/mtime captured at enumeration.
+    case sourceChanged
     case other(code: Int32, detail: String)
 }

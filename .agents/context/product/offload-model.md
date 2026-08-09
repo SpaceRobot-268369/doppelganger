@@ -49,6 +49,19 @@ Rules that follow from it:
 - **Interruption is a defined outcome.** A yanked card or unmounted destination
   produces a manifest describing what was verified before the interruption. It
   never produces silence, and never produces success.
+- **Publishing a file is atomic.** Bytes are written and closed under a hidden,
+  transfer-scoped staging name, then exclusively renamed to the final name.
+  A crash or failed write never leaves a partial file masquerading as footage.
+- **Evidence is part of success.** If the required JSON/Markdown/MHL records
+  cannot be written everywhere expected, the transfer is failed even when all
+  media bytes verified. No stale `verified` record or partial MHL remains.
+- **The source plan is stable.** Size and modification metadata are checked
+  before a staged file is published, and the complete source is enumerated
+  again after copy/verification. A changing source fails the transfer.
+- **An empty or zero-byte source is not success.** It is blocked before any
+  destination media is touched and recorded as a failed run in the app spool.
+- **Each offload owns a new output folder.** Preflight rejects existing output
+  roots and overlap with the source. Name collisions never overwrite a file.
 
 ## Checksums
 
@@ -92,3 +105,8 @@ failure and a defined manifest outcome:
 - filesystem case-sensitivity mismatch between source and destination
 - filename or path length limits on the destination filesystem
 - machine sleeps mid-transfer
+- source contents or metadata change during transfer
+- empty source or zero-byte source item
+- source/destination or two destinations share one physical volume
+- required manifest/report/MHL evidence cannot be written
+- app exits before a terminal report (recovered from a durable journal)

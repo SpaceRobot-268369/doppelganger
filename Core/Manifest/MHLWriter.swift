@@ -3,11 +3,10 @@ import Foundation
 /// Media Hash List (MHL) v1.1 output — the interchange format facilities and
 /// other offload tools verify against.
 ///
-/// One MHL is written per destination, and it lists **only the items that
-/// verified at that destination**: an MHL is evidence that specific copies
-/// were hashed and matched, never a record of failures. Failures live in the
-/// JSON manifest and the Markdown report. A destination with nothing verified
-/// gets no MHL at all.
+/// One MHL is written per destination only after the complete transfer is
+/// verified. A failed or cancelled run never emits a partial MHL that could be
+/// mistaken for proof that the whole card completed; its detail lives in the
+/// JSON manifest and Markdown report.
 public enum MHLWriter {
     public static func fileName(shortID: String) -> String {
         "doppelganger-\(shortID).mhl"
@@ -16,6 +15,10 @@ public enum MHLWriter {
     /// The MHL XML for one destination, or `nil` if nothing verified there.
     /// Deterministic: identical report input produces byte-identical output.
     public static func xml(for report: TransferReport, destination: URL) -> String? {
+        // A partial MHL beside a failed transfer can be mistaken for evidence
+        // that the whole card is complete. Failed/cancelled detail remains in
+        // the JSON manifest and report; retry produces a fresh complete MHL.
+        guard report.status == .verified else { return nil }
         let verified = report.items.filter { $0.outcomes[destination]?.isVerified == true }
         guard !verified.isEmpty else { return nil }
 

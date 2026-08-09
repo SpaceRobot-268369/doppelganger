@@ -29,12 +29,21 @@ That audience dictates the design posture:
   verification must be impossible to mistake for a good one.
 - **Trustworthy under interruption.** Cards get yanked, drives get unplugged,
   laptops sleep. The tool must be honest about what completed.
+- **Review before writing.** Operators see exact output folders, volume
+  independence, capacity, empty/zero-byte findings, and blocking issues before
+  an offload starts.
+- **Readable at task density.** Several simultaneous offloads must remain
+  scannable; animation and translucent decoration cannot compete with status.
 
 ## Scope
 
 **In scope:** multi-destination copy, streaming checksum verification, transfer
 manifests/logs, source and destination selection with persistence across launches,
-progress reporting, and clear per-file result reporting.
+progress reporting, clear per-file result reporting, resource-aware multi-task
+queueing, durable history, interruption recovery, and an optional Project /
+Shooting Day context for organizing both new work and historical transfer tasks.
+Transfers must remain possible without creating or selecting a Project, and
+organizational changes must never rewrite their verification evidence.
 
 **Explicitly deferred:** cloud upload, transcoding, proxy generation, media
 playback and review, and any form of card formatting or source deletion. Source

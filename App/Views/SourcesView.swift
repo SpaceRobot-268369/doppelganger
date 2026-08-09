@@ -45,15 +45,16 @@ struct SourcesView: View {
                         .buttonStyle(.glassProminent)
                         .tint(.blue)
                         Button {
-                            NSWorkspace.shared.activateFileViewerSelecting([volume.url])
+                            NSWorkspace.shared.open(volume.url)
                         } label: {
-                            Image(systemName: "magnifyingglass")
+                            Image(systemName: "folder")
                         }
                         .buttonStyle(.glass)
-                        .help("Reveal in Finder")
+                        .help("Open in Finder")
                     }
                     .padding(14)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 14))
+                    .background(.background.secondary, in: RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(.separator.opacity(0.4)))
                 }
                 Text("Recent")
                     .font(.headline)
@@ -146,13 +147,13 @@ private struct RecentsListView<TopSection: View>: View {
                     .tint(.blue)
             }
             Button {
-                NSWorkspace.shared.activateFileViewerSelecting([url])
+                NSWorkspace.shared.open(url)
             } label: {
-                Image(systemName: "magnifyingglass")
+                Image(systemName: "folder")
             }
             .buttonStyle(.glass)
             .disabled(!mounted)
-            .help("Reveal in Finder")
+            .help("Open in Finder")
             Button {
                 onRemove(url)
             } label: {
@@ -162,6 +163,7 @@ private struct RecentsListView<TopSection: View>: View {
             .help("Remove from this list")
         }
         .padding(14)
-        .glassEffect(.regular, in: .rect(cornerRadius: 14))
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(.separator.opacity(0.4)))
     }
 }

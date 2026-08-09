@@ -6,10 +6,16 @@ in the mold of Hedge and Offshoot.
 
 ## Status
 
-**Pre-implementation.** This repository currently contains the agent file system
-and documentation only. There is no application source yet.
+**MVP/demo implementation.** The repository contains a native SwiftUI macOS app,
+a bounded-memory copy-and-verify engine, JSON/Markdown/MHL evidence, multi-task
+queueing, preflight safety review, interruption recovery, and automated tests.
 
-Planned stack: Swift + SwiftUI, macOS-only, Xcode project built with `xcodebuild`.
+The demo is deliberately conservative: it never deletes or formats source media,
+requires a new output folder for each offload, and reports success only after
+every requested copy passes read-back checksum verification and the required
+evidence files are written.
+
+Stack: Swift 6 + SwiftUI, macOS 26+, built with `xcodebuild`.
 
 ## Layout
 
@@ -33,7 +39,7 @@ under [`.agents/`](.agents/):
 - [`.agents/context/dev-spec/`](.agents/context/dev-spec/) — stack, conventions,
   worktree and git workflow, prerequisites.
 - [`.agents/context/product/`](.agents/context/product/) — what the product does
-  and the domain vocabulary it uses.
+  and the domain vocabulary and visual language it uses.
 - [`.agents/skills/`](.agents/skills/) — reusable agent workflows.
 
 `CLAUDE.md`, `.codex/`, and `.cursor/` are thin adapters that defer to `AGENTS.md`.

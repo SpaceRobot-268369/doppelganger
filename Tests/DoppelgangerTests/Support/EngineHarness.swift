@@ -33,7 +33,7 @@ enum EngineHarness {
         )
         let request = TransferRequest(
             sourceRoot: source, destinationRoots: destinations,
-            algorithm: algorithm, spoolDirectory: spool)
+            algorithm: algorithm, spoolDirectory: spool, allowSameVolume: true)
         var events: [TransferEvent] = []
         var report: TransferReport?
         var cancelSent = false

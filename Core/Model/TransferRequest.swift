@@ -1,5 +1,18 @@
 import Foundation
 
+/// One requested destination: the user-selected base plus the new task folder
+/// that will contain this transfer. Keeping both makes capacity/volume checks
+/// possible before the output folder exists.
+public struct TransferDestination: Sendable, Hashable {
+    public let baseRoot: URL
+    public let outputRoot: URL
+
+    public init(baseRoot: URL, outputRoot: URL) {
+        self.baseRoot = baseRoot
+        self.outputRoot = outputRoot
+    }
+}
+
 /// Everything the engine needs to run one transfer. The unit the user starts,
 /// watches, and trusts.
 public struct TransferRequest: Sendable {
@@ -9,24 +22,54 @@ public struct TransferRequest: Sendable {
     public let sourceRoot: URL
     /// One or more; every one must independently pass verification for the
     /// transfer to succeed.
-    public let destinationRoots: [URL]
+    public let destinations: [TransferDestination]
     public let algorithm: ChecksumAlgorithm
     /// App-side directory that always receives a copy of the manifest, report,
     /// and log — even when every destination is unreachable.
     public let spoolDirectory: URL
+    /// Same-volume copies are useful for synthetic/local demos but are not
+    /// independent backups. The UI must surface and explicitly acknowledge it.
+    public let allowSameVolume: Bool
+    /// New offloads require a fresh task folder. Engine tests and explicit
+    /// legacy/folder workflows may opt out while retaining collision safety.
+    public let requireNewOutputRoots: Bool
+
+    public var destinationRoots: [URL] { destinations.map(\.outputRoot) }
 
     public init(
         id: UUID = UUID(),
         sourceRoot: URL,
         destinationRoots: [URL],
         algorithm: ChecksumAlgorithm = .xxh64,
-        spoolDirectory: URL
+        spoolDirectory: URL,
+        allowSameVolume: Bool = false,
+        requireNewOutputRoots: Bool = false
     ) {
         self.id = id
         self.sourceRoot = sourceRoot
-        self.destinationRoots = destinationRoots
+        self.destinations = destinationRoots.map { TransferDestination(baseRoot: $0, outputRoot: $0) }
         self.algorithm = algorithm
         self.spoolDirectory = spoolDirectory
+        self.allowSameVolume = allowSameVolume
+        self.requireNewOutputRoots = requireNewOutputRoots
+    }
+
+    public init(
+        id: UUID = UUID(),
+        sourceRoot: URL,
+        destinations: [TransferDestination],
+        algorithm: ChecksumAlgorithm = .xxh64,
+        spoolDirectory: URL,
+        allowSameVolume: Bool = false,
+        requireNewOutputRoots: Bool = true
+    ) {
+        self.id = id
+        self.sourceRoot = sourceRoot
+        self.destinations = destinations
+        self.algorithm = algorithm
+        self.spoolDirectory = spoolDirectory
+        self.allowSameVolume = allowSameVolume
+        self.requireNewOutputRoots = requireNewOutputRoots
     }
 
     /// Stable short identifier used in generated file names.

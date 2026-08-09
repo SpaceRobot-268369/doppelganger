@@ -3,6 +3,9 @@
 public enum ItemFailureReason: Sendable, Hashable {
     case sourceUnreadable(detail: String)
     case sourceUnmounted
+    case sourceChanged
+    case emptySource
+    case zeroByteSource
     case destinationUnmounted
     case destinationFull
     case checksumMismatch(expected: String, actual: String)
@@ -15,6 +18,9 @@ public enum ItemFailureReason: Sendable, Hashable {
         switch self {
         case .sourceUnreadable: "source-unreadable"
         case .sourceUnmounted: "source-unmounted"
+        case .sourceChanged: "source-changed"
+        case .emptySource: "empty-source"
+        case .zeroByteSource: "zero-byte-source"
         case .destinationUnmounted: "destination-unmounted"
         case .destinationFull: "destination-full"
         case .checksumMismatch: "checksum-mismatch"

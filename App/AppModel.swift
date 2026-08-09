@@ -1,11 +1,13 @@
 import Foundation
 import Observation
+import SwiftUI
 
 enum SidebarSection: String, Hashable, CaseIterable, Identifiable {
     case transfers
     case sources
     case destinations
     case manifests
+    case preferences
 
     var id: String { rawValue }
 
@@ -15,6 +17,7 @@ enum SidebarSection: String, Hashable, CaseIterable, Identifiable {
         case .sources: "Sources"
         case .destinations: "Destinations"
         case .manifests: "Manifests"
+        case .preferences: "Preferences"
         }
     }
 
@@ -24,6 +27,43 @@ enum SidebarSection: String, Hashable, CaseIterable, Identifiable {
         case .sources: "sdcard"
         case .destinations: "externaldrive"
         case .manifests: "doc.text"
+        case .preferences: "gearshape"
+        }
+    }
+}
+
+/// How the app picks its light/dark appearance. `system` follows the Mac.
+enum AppearancePreference: String, CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    static let storageKey = "prefs.appearance"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: "System"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .system: "circle.lefthalf.filled"
+        case .light: "sun.max"
+        case .dark: "moon"
+        }
+    }
+
+    /// `nil` hands the decision back to the system.
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
         }
     }
 }
@@ -31,10 +71,18 @@ enum SidebarSection: String, Hashable, CaseIterable, Identifiable {
 enum TransferFilter: String, CaseIterable, Identifiable {
     case all
     case active
-    case complete
+    case attention
+    case verified
 
     var id: String { rawValue }
-    var title: String { rawValue.capitalized }
+    var title: String {
+        switch self {
+        case .all: "All"
+        case .active: "Active"
+        case .attention: "Needs Attention"
+        case .verified: "Verified"
+        }
+    }
 }
 
 /// Top-level dashboard state: the session list, sidebar routing, the
@@ -58,6 +106,7 @@ final class AppModel {
     var draftDestinations: [URL] = [] {
         didSet { persistDraft() }
     }
+    var draftName = ""
     var draftAlgorithm: ChecksumAlgorithm = .xxh64
 
     private(set) var recentSources: [URL] = []
@@ -83,8 +132,13 @@ final class AppModel {
         let saved = selectionStore.load()
         draftSource = saved.source
         draftDestinations = saved.destinations
+        if let source = saved.source {
+            draftName = TransferPreflight.defaultFolderName(for: source)
+        }
         recentSources = recents.sources()
         recentDestinations = recents.destinations()
+        let journalStore = TransferJournalStore(root: TransferSession.spoolDirectory)
+        sessions = journalStore.recoverInterrupted().map(TransferSession.init(interrupted:))
         volumeWatcher.onCardMounted = { [weak self] volume in
             self?.mountBanner = volume
         }
@@ -108,12 +162,17 @@ final class AppModel {
         switch filter {
         case .all: sessions
         case .active: sessions.filter(\.isActive)
-        case .complete: sessions.filter { !$0.isActive }
+        case .attention: sessions.filter { $0.report?.status != .verified && !$0.isActive }
+        case .verified: sessions.filter { $0.report?.status == .verified }
         }
     }
 
     var activeCount: Int { sessions.filter(\.isActive).count }
     var completeCount: Int { sessions.count - activeCount }
+    var attentionCount: Int {
+        sessions.filter { $0.report?.status != .verified && !$0.isActive }.count
+    }
+    var verifiedCount: Int { sessions.filter { $0.report?.status == .verified }.count }
     var runningCount: Int { sessions.filter(\.isRunning).count }
 
     var totalPlannedBytes: Int64 { sessions.reduce(0) { $0 + $1.planTotalBytes } }
@@ -122,10 +181,7 @@ final class AppModel {
     /// Quiet green only while nothing has failed; a failed or cancelled
     /// transfer flips the footer to a loud warning until its card is dismissed.
     var systemNominal: Bool {
-        !sessions.contains { session in
-            guard let report = session.report else { return false }
-            return report.status != .verified
-        }
+        !sessions.contains { $0.hasAttention }
     }
 
     func remove(_ session: TransferSession) {
@@ -140,6 +196,20 @@ final class AppModel {
         sessions.removeAll { $0.id == session.id }
     }
 
+    /// A failed/interrupted transfer is retried as a fresh reviewed offload in
+    /// a new folder. The old incomplete directory remains untouched.
+    func retryAsNewOffload(_ session: TransferSession) {
+        draftSource = session.source
+        draftDestinations = session.destinationBases
+        let stamp = String(Date().formatted(.iso8601).prefix(19))
+            .replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: "T", with: "-")
+        draftName = TransferPreflight.validFolderName("\(session.label)-retry-\(stamp)")
+        draftAlgorithm = session.algorithm
+        section = .transfers
+        showingNewOffload = true
+    }
+
     // MARK: - Queue scheduling
 
     /// User-set ceiling on simultaneous transfers; queued sessions start as
@@ -151,9 +221,13 @@ final class AppModel {
     }
 
     private func scheduleQueued() {
+        var occupied = Set(sessions.filter(\.isRunning).flatMap(\.resourceIDs))
         while runningCount < maxConcurrent,
-              let next = sessions.first(where: \.isQueued) {
+              let next = sessions.first(where: {
+                  $0.isQueued && $0.resourceIDs.isDisjoint(with: occupied)
+              }) {
             next.start()
+            occupied.formUnion(next.resourceIDs)
         }
     }
 
@@ -165,6 +239,9 @@ final class AppModel {
             return "The source folder is not mounted."
         }
         guard !draftDestinations.isEmpty else { return "Add at least one destination." }
+        guard !TransferPreflight.validFolderName(draftName).isEmpty else {
+            return "Enter a transfer folder name."
+        }
         let sourcePath = source.standardizedFileURL.path
         var seen = Set<String>()
         for destination in draftDestinations {
@@ -199,15 +276,34 @@ final class AppModel {
     /// Open the New Offload sheet, optionally pre-selecting a source (used by
     /// the Sources page's quick-offload action).
     func beginOffload(source: URL? = nil) {
-        if let source { draftSource = source }
+        if let source {
+            draftSource = source
+            draftName = TransferPreflight.defaultFolderName(for: source)
+        } else if draftName.isEmpty, let draftSource {
+            draftName = TransferPreflight.defaultFolderName(for: draftSource)
+        }
         section = .transfers
         showingNewOffload = true
     }
 
-    func startDraftOffload(autoShowLog: Bool) {
-        guard let source = draftSource, canStartDraft else { return }
+    func startDraftOffload(
+        autoShowLog: Bool,
+        preflight: TransferPreflight,
+        warningsAcknowledged: Bool
+    ) {
+        guard let source = draftSource,
+              canStartDraft,
+              preflight.canStart,
+              preflight.matches(source: source, destinations: draftDestinations, folderName: draftName),
+              !preflight.requiresAcknowledgement || warningsAcknowledged
+        else { return }
         let session = TransferSession(
-            source: source, destinations: draftDestinations, algorithm: draftAlgorithm)
+            label: preflight.folderName,
+            source: source,
+            destinations: preflight.requestDestinations,
+            algorithm: draftAlgorithm,
+            allowSameVolume: warningsAcknowledged
+        )
         session.showLog = autoShowLog
         session.onFinished = { [weak self, weak session] in
             guard let self else { return }

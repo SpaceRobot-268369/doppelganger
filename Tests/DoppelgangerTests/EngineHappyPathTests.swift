@@ -86,7 +86,7 @@ struct EngineHappyPathTests {
         #expect(run.phases == [.enumerating, .copying, .verifying, .writingManifest, .done])
     }
 
-    @Test func emptySourceVerifiesVacuouslyWithManifest() async throws {
+    @Test func emptySourceFailsAndWritesOnlySpoolEvidence() async throws {
         let fixtures = try FixtureBuilder()
         let emptyCard = try fixtures.makeDestination(named: "empty-card")
         let destination = try fixtures.makeDestination(named: "dest")
@@ -95,9 +95,34 @@ struct EngineHappyPathTests {
             fileSystem: RealFileSystem(), source: emptyCard, destinations: [destination],
             spool: fixtures.root.appendingPathComponent("spool"))
 
-        #expect(run.report.status == .verified)
+        #expect(run.report.status == .failed)
         #expect(run.report.items.isEmpty)
-        let manifest = try EngineHarness.decodeManifest(at: destination, shortID: run.report.shortID)
+        #expect(!FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent(
+                ManifestWriter.manifestFileName(shortID: run.report.shortID)
+            ).path
+        ))
+        let spoolTarget = try #require(run.report.spoolLocation)
+        let manifest = try EngineHarness.decodeManifest(at: spoolTarget, shortID: run.report.shortID)
+        #expect(manifest.status == "failed")
         #expect(manifest.summary.itemCount == 0)
+    }
+
+    @Test func zeroByteSourceFailsBeforeDestinationsAreTouched() async throws {
+        let fixtures = try FixtureBuilder()
+        let card = try fixtures.makeCard(files: [
+            .init("valid.mov", size: 32, seed: 1),
+            .init("empty.mov", size: 0, seed: 2),
+        ])
+        let destination = try fixtures.makeDestination(named: "dest")
+
+        let run = try await EngineHarness.run(
+            fileSystem: RealFileSystem(), source: card, destinations: [destination],
+            spool: fixtures.root.appendingPathComponent("spool"))
+
+        #expect(run.report.status == .failed)
+        #expect(run.report.outcome("empty.mov", at: destination) == .failed(.zeroByteSource))
+        #expect(run.report.outcome("valid.mov", at: destination) == .skipped(.sourceUnavailable))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
     }
 }

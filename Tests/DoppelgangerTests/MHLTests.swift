@@ -34,14 +34,11 @@ struct MHLTests {
         #expect(xml == expected)
     }
 
-    @Test func onlyVerifiedItemsAtThatDestinationAreListed() throws {
-        // destinationA of the failed report verified A001 but not A002: the
-        // MHL must list exactly the verified item — an MHL never records
-        // failures or skips.
+    @Test func failedTransferProducesNoPotentiallyMisleadingPartialMHL() {
+        // A partial MHL beside a failed run is easy to mistake for evidence
+        // that the whole card completed. Detail remains in JSON/Markdown.
         let xml = MHLWriter.xml(for: ReportFixtures.failedReport(), destination: ReportFixtures.destinationA)
-        let mhl = try #require(xml)
-        #expect(mhl.contains("<file>DCIM/100MEDIA/A001.MP4</file>"))
-        #expect(!mhl.contains("A002"))
+        #expect(xml == nil)
     }
 
     @Test func destinationWithNothingVerifiedGetsNoMHL() {

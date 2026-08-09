@@ -28,6 +28,9 @@ public struct TransferReport: Sendable {
     public let startedAt: Date
     public let finishedAt: Date
     public let items: [ItemResult]
+    /// Transfer-level failures that do not belong to one item/destination pair,
+    /// such as an evidence write failure or a source plan changing mid-run.
+    public let issues: [String]
     /// Every location a manifest was successfully written (destinations that
     /// were reachable, plus the spool directory).
     public let manifestLocations: [URL]
@@ -41,7 +44,8 @@ public struct TransferReport: Sendable {
         startedAt: Date,
         finishedAt: Date,
         items: [ItemResult],
-        manifestLocations: [URL]
+        manifestLocations: [URL],
+        issues: [String] = []
     ) {
         self.id = id
         self.status = status
@@ -52,6 +56,7 @@ public struct TransferReport: Sendable {
         self.finishedAt = finishedAt
         self.items = items
         self.manifestLocations = manifestLocations
+        self.issues = issues
     }
 
     public var totalBytes: Int64 { items.reduce(0) { $0 + $1.item.size } }

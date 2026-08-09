@@ -8,11 +8,10 @@ public struct RealFileSystem: FileSystemAccess {
     public init() {}
 
     /// Regular files under `root`, relative paths preserved, sorted for
-    /// determinism. Dot-prefixed files and directories (`.DS_Store`,
-    /// `.Spotlight-V100`, `.fseventsd`, …) are index/metadata noise on camera
-    /// cards and are skipped. Enumeration never writes anything under `root`.
+    /// determinism. Only known operating-system metadata is excluded; arbitrary
+    /// hidden files are media unless the user explicitly configures otherwise.
     public func enumerate(root: URL) throws -> [SourceItem] {
-        let resolvedRoot = root.resolvingSymlinksInPath()
+        let resolvedRoot = canonicalURL(root)
         let rootPath = resolvedRoot.path
         let manager = FileManager()
 
@@ -23,22 +22,86 @@ public struct RealFileSystem: FileSystemAccess {
 
         guard let enumerator = manager.enumerator(
             at: resolvedRoot,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
+            options: []
         ) else {
             throw FileSystemError.notReadable(detail: "\(rootPath): could not enumerate")
         }
 
         var items: [SourceItem] = []
         for case let url as URL in enumerator {
-            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            let relativeUnresolved = String(url.path.dropFirst(rootPath.count + 1))
+            if Self.isKnownMetadata(relativeUnresolved) {
+                if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+            let values = try? url.resourceValues(
+                forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+            )
             guard values?.isRegularFile == true else { continue }
             let resolved = url.resolvingSymlinksInPath().path
             guard resolved.hasPrefix(rootPath + "/") else { continue }
             let relativePath = String(resolved.dropFirst(rootPath.count + 1))
-            items.append(SourceItem(relativePath: relativePath, size: Int64(values?.fileSize ?? 0)))
+            items.append(SourceItem(
+                relativePath: relativePath,
+                size: Int64(values?.fileSize ?? 0),
+                modificationTime: values?.contentModificationDate?.timeIntervalSince1970
+            ))
         }
         return items.sorted { $0.relativePath < $1.relativePath }
+    }
+
+    public func canonicalURL(_ url: URL) -> URL {
+        url.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    public func volume(at url: URL) throws -> FileSystemVolume {
+        var existing = url.standardizedFileURL
+        let manager = FileManager.default
+        while !manager.fileExists(atPath: existing.path), existing.path != "/" {
+            existing.deleteLastPathComponent()
+        }
+        let keys: Set<URLResourceKey> = [
+            .volumeURLKey, .volumeUUIDStringKey, .volumeNameKey,
+            .volumeLocalizedFormatDescriptionKey, .volumeAvailableCapacityForImportantUsageKey,
+            .volumeTotalCapacityKey, .volumeIsRemovableKey, .volumeIsReadOnlyKey,
+            .volumeSupportsCaseSensitiveNamesKey,
+        ]
+        let values = try existing.resourceValues(forKeys: keys)
+        let mount = values.volume ?? existing
+        let identifier = values.volumeUUIDString ?? canonicalURL(mount).path
+        return FileSystemVolume(
+            identifier: identifier,
+            name: values.volumeName ?? mount.lastPathComponent,
+            mountPath: mount.path,
+            fileSystem: values.volumeLocalizedFormatDescription,
+            availableBytes: values.volumeAvailableCapacityForImportantUsage,
+            totalBytes: values.volumeTotalCapacity.map(Int64.init),
+            isRemovable: values.volumeIsRemovable ?? false,
+            isReadOnly: values.volumeIsReadOnly ?? false,
+            supportsCaseSensitiveNames: values.volumeSupportsCaseSensitiveNames,
+            maximumNameBytes: Self.pathLimit(existing.path, key: _PC_NAME_MAX),
+            maximumPathBytes: Self.pathLimit(existing.path, key: _PC_PATH_MAX)
+        )
+    }
+
+    public func sourceItem(at url: URL, relativeTo root: URL) throws -> SourceItem {
+        let canonicalRoot = canonicalURL(root)
+        let canonicalItem = canonicalURL(url)
+        guard canonicalItem.path.hasPrefix(canonicalRoot.path + "/") else {
+            throw FileSystemError.sourceChanged
+        }
+        let values = try canonicalItem.resourceValues(
+            forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        )
+        guard values.isRegularFile == true else { throw FileSystemError.sourceChanged }
+        return SourceItem(
+            relativePath: String(canonicalItem.path.dropFirst(canonicalRoot.path.count + 1)),
+            size: Int64(values.fileSize ?? 0),
+            modificationTime: values.contentModificationDate?.timeIntervalSince1970
+        )
     }
 
     public func fileExists(at url: URL) -> Bool {
@@ -67,6 +130,12 @@ public struct RealFileSystem: FileSystemAccess {
         try PosixWriteStream(url: url)
     }
 
+    public func moveItemExclusive(from staging: URL, to final: URL) throws {
+        if renameatx_np(AT_FDCWD, staging.path, AT_FDCWD, final.path, UInt32(RENAME_EXCL)) != 0 {
+            throw IOContext.writing.map(errno, path: final.path)
+        }
+    }
+
     public func removeItem(at url: URL) throws {
         if unlink(url.path) != 0 {
             throw IOContext.writing.map(errno, path: url.path)
@@ -79,5 +148,23 @@ public struct RealFileSystem: FileSystemAccess {
             throw IOContext.reading.map(errno, path: url.path)
         }
         return Int64(stats.f_bavail) * Int64(stats.f_bsize)
+    }
+
+    private static func isKnownMetadata(_ relativePath: String) -> Bool {
+        let components = relativePath.split(separator: "/").map(String.init)
+        return components.contains { component in
+            component == ".DS_Store"
+                || component == ".Spotlight-V100"
+                || component == ".fseventsd"
+                || component == ".Trashes"
+                || component == ".TemporaryItems"
+                || component.hasPrefix("._")
+                || component.hasPrefix(".doppelganger-partial-")
+        }
+    }
+
+    private static func pathLimit(_ path: String, key: Int32) -> Int? {
+        let value = pathconf(path, key)
+        return value > 0 ? value : nil
     }
 }

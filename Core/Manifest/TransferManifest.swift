@@ -30,6 +30,7 @@ public struct TransferManifest: Codable, Sendable, Equatable {
 
         public var relativePath: String
         public var size: Int64
+        public var modifiedAt: String? = nil
         /// Source digest in lowercase hex; absent if the source was never read.
         public var digest: String?
         public var results: [Result]
@@ -57,6 +58,9 @@ public struct TransferManifest: Codable, Sendable, Equatable {
     public var finishedAt: String
     public var summary: Summary
     public var items: [ItemRecord]
+    /// Optional for backward compatibility with manifests written by early
+    /// demo builds.
+    public var issues: [String]? = nil
 }
 
 extension TransferManifest {
@@ -88,6 +92,9 @@ extension TransferManifest {
             ItemRecord(
                 relativePath: item.item.relativePath,
                 size: item.item.size,
+                modifiedAt: item.item.modificationTime.map {
+                    Date(timeIntervalSince1970: $0).formatted(iso)
+                },
                 digest: item.sourceDigest,
                 results: report.destinations.map { destination in
                     Self.result(for: item.outcomes[destination], destination: destination)
@@ -112,7 +119,8 @@ extension TransferManifest {
                 failedCount: report.failedCount,
                 skippedCount: report.skippedCount
             ),
-            items: itemRecords
+            items: itemRecords,
+            issues: report.issues.isEmpty ? nil : report.issues
         )
     }
 

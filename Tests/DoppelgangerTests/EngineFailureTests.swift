@@ -222,4 +222,50 @@ struct EngineFailureTests {
         #expect(run.report.manifestLocations.count == 1)
         #expect(run.report.spoolLocation != nil)
     }
+
+    @Test func evidenceWriteFailureDowngradesVerifiedCopiesToFailedTransfer() async throws {
+        let world = try makeWorld()
+        world.fs.failEvidenceWrites(under: world.destB)
+
+        let run = try await EngineHarness.run(
+            fileSystem: world.fs, source: world.card,
+            destinations: [world.destA, world.destB], spool: world.spool)
+
+        #expect(run.report.status == .failed)
+        #expect(run.report.verifiedCount == EngineHarness.standardFiles.count * 2)
+        #expect(run.report.issues.contains { $0.contains(world.destB.path) })
+
+        let destinationManifest = try EngineHarness.decodeManifest(
+            at: world.destA, shortID: run.report.shortID)
+        let spool = try #require(run.report.spoolLocation)
+        let spoolManifest = try EngineHarness.decodeManifest(at: spool, shortID: run.report.shortID)
+        #expect(destinationManifest.status == "failed")
+        #expect(spoolManifest.status == "failed")
+        #expect(!FileManager.default.fileExists(
+            atPath: world.destA.appendingPathComponent(
+                MHLWriter.fileName(shortID: run.report.shortID)
+            ).path
+        ))
+        try expectSourceUntouched(world)
+    }
+
+    @Test func sourceChangeNeverPublishesTheStagedFile() async throws {
+        let world = try makeWorld()
+        world.fs.markSourceChanged(pathSuffix: "DCIM/100MEDIA/a.bin")
+
+        let run = try await EngineHarness.run(
+            fileSystem: world.fs, source: world.card,
+            destinations: [world.destA, world.destB], spool: world.spool)
+
+        #expect(run.report.status == .failed)
+        for destination in [world.destA, world.destB] {
+            #expect(run.report.outcome("DCIM/100MEDIA/a.bin", at: destination) == .failed(.sourceChanged))
+            let final = destination.appendingPathComponent("DCIM/100MEDIA/a.bin")
+            #expect(!FileManager.default.fileExists(atPath: final.path))
+            let parent = final.deletingLastPathComponent()
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? []
+            #expect(!names.contains { $0.hasPrefix(".doppelganger-partial-") })
+        }
+        try expectSourceUntouched(world)
+    }
 }

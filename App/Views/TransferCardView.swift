@@ -9,7 +9,9 @@ struct TransferCardView: View {
     @Bindable var session: TransferSession
     let index: Int
 
-    @State private var expanded = true
+    @State private var expanded = false
+    @State private var isEjecting = false
+    @State private var ejectMessage: String?
 
     private static let tileHeight: CGFloat = 76
     private static let tileSpacing: CGFloat = 10
@@ -23,8 +25,8 @@ struct TransferCardView: View {
                     statsCluster
                 }
                 detail
-            } else if session.isRunning {
-                collapsedProgress
+            } else {
+                collapsedSummary
             }
         }
         .padding(18)
@@ -34,14 +36,41 @@ struct TransferCardView: View {
                 .strokeBorder(.separator.opacity(0.5), lineWidth: 1)
         )
         .animation(.snappy, value: expanded)
+        .onAppear {
+            if session.isRunning && index == 1 { expanded = true }
+        }
+        .onChange(of: session.report?.status) {
+            if session.report != nil { expanded = false }
+        }
     }
 
-    /// Collapsed active cards keep a slim progress line so nothing looks stalled.
-    private var collapsedProgress: some View {
-        ProgressView(value: session.overallFraction)
-            .progressViewStyle(.linear)
-            .controlSize(.small)
-            .tint(.green)
+    /// Compact cards keep several jobs visible while retaining topology and a
+    /// truthful phase/result at a glance.
+    private var collapsedSummary: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Label(session.sourceName, systemImage: "sdcard")
+                    .lineLimit(1)
+                Image(systemName: "arrow.right")
+                    .foregroundStyle(.tertiary)
+                Text(session.destinations.map { $0.deletingLastPathComponent().lastPathComponent }.joined(separator: " · "))
+                    .lineLimit(1)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if session.isActive {
+                    Text("\(Int(session.overallFraction * 100))%")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption)
+            if session.isActive {
+                ProgressView(value: session.overallFraction)
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+                    .tint(session.progress.phase == .verifying ? .cyan : .blue)
+            }
+        }
     }
 
     // MARK: - Header
@@ -52,7 +81,7 @@ struct TransferCardView: View {
                 .font(.callout.weight(.semibold))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-            StatusDot(active: session.isRunning)
+            StatusDot(color: statusDotColor, active: session.isRunning)
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.displayName)
                     .font(.title3.weight(.semibold))
@@ -87,6 +116,7 @@ struct TransferCardView: View {
                 }
                 .buttonStyle(.glass)
                 .help("Remove from list (files and reports stay on disk)")
+                .accessibilityLabel("Remove transfer from list")
             }
             Button {
                 withAnimation(.snappy) { expanded.toggle() }
@@ -94,12 +124,20 @@ struct TransferCardView: View {
                 Image(systemName: expanded ? "chevron.up" : "chevron.down")
             }
             .buttonStyle(.glass)
+            .accessibilityLabel(expanded ? "Collapse transfer details" : "Expand transfer details")
         }
     }
 
     private var headlineColor: Color {
         if session.headline.isProblem { return .red }
-        return session.isRunning ? .green : .secondary
+        guard session.isRunning else { return .secondary }
+        return session.progress.phase == .verifying ? .cyan : .blue
+    }
+
+    private var statusDotColor: Color {
+        if session.headline.isProblem { return .red }
+        if session.report?.status == .verified { return .green }
+        return session.isRunning ? .blue : .secondary
     }
 
     // MARK: - Flow graph
@@ -132,8 +170,10 @@ struct TransferCardView: View {
         if session.destinationErrorCount(destination) > 0 { return .problem }
         switch session.destinationState(destination) {
         case .pending: return .pending
+        case .copying: return .copying
+        case .verifying: return .verifying
+        case .verified: return .verified
         case .failed: return .problem
-        case .copying, .verifying, .verified: return .ok
         }
     }
 
@@ -146,22 +186,41 @@ struct TransferCardView: View {
                 .glassEffect(.regular, in: .rect(cornerRadius: 9))
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(session.displayName)
+                    Text(session.sourceName)
                         .font(.callout.weight(.semibold))
                         .lineLimit(1)
                     if session.planTotalBytes > 0 {
                         Text("· \(Format.bytes(session.planTotalBytes))")
                             .font(.callout)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                 }
                 labeledValue("FILES", session.planItemCount > 0 ? "\(session.planItemCount)" : "—")
                 labeledValue("ID", session.shortID.isEmpty ? "—" : session.shortID.uppercased())
             }
             Spacer(minLength: 0)
+            openFolderButton(session.source, label: "Open source in Finder")
         }
         .padding(12)
-        .glassEffect(.regular, in: .rect(cornerRadius: 14))
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// The explicit "open this folder in Finder" affordance on source chips
+    /// and destination tiles.
+    private func openFolderButton(_ url: URL, label: String) -> some View {
+        Button {
+            NSWorkspace.shared.open(url)
+        } label: {
+            Image(systemName: "folder")
+                .padding(2)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.glass)
+        .controlSize(.small)
+        .help("Open \(url.path) in Finder")
+        .accessibilityLabel(label)
     }
 
     private func labeledValue(_ label: String, _ value: String) -> some View {
@@ -184,7 +243,7 @@ struct TransferCardView: View {
                 .font(.title3)
                 .foregroundStyle(state == .failed ? AnyShapeStyle(.red) : AnyShapeStyle(.tint))
             VStack(alignment: .leading, spacing: 2) {
-                Text(destination.lastPathComponent)
+                Text(session.baseDestination(for: destination).lastPathComponent)
                     .font(.callout.weight(.semibold))
                     .lineLimit(1)
                 if session.planTotalBytes > 0 {
@@ -199,36 +258,31 @@ struct TransferCardView: View {
             }
             .help(destination.path)
             Spacer(minLength: 8)
+            openFolderButton(destination, label: "Open destination output in Finder")
             trailingIndicator(state, for: destination)
         }
         .padding(.horizontal, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassEffect(
-            state == .failed ? .regular.tint(.red.opacity(0.2)) : .regular,
-            in: .rect(cornerRadius: 14)
+        .background(
+            state == .failed ? Color.red.opacity(0.12) : Color.primary.opacity(0.045),
+            in: RoundedRectangle(cornerRadius: 14)
         )
     }
 
     private func destinationCaption(_ destination: URL) -> String {
         var caption = "\(Format.bytes(session.planTotalBytes)) · \(Int(session.destinationFraction(destination) * 100))%"
-        if let free = Self.freeSpace(of: destination) {
+        if let free = session.availableBytesByDestination[destination] {
             caption += " · \(Format.bytes(free)) free"
         }
         return caption
-    }
-
-    /// Live free space on the destination's volume — a cheap statfs, so it can
-    /// ride along with progress updates.
-    private static func freeSpace(of url: URL) -> Int64? {
-        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        return values?.volumeAvailableCapacityForImportantUsage
     }
 
     private func statusColor(_ state: TransferSession.DestinationState, errors: Int) -> Color {
         if errors > 0 || state == .failed { return .red }
         switch state {
         case .pending: return .secondary
-        case .copying, .verifying: return .green
+        case .copying: return .blue
+        case .verifying: return .cyan
         case .verified: return .green
         case .failed: return .red
         }
@@ -248,7 +302,8 @@ struct TransferCardView: View {
         case .pending, .copying, .verifying:
             ProgressRing(
                 fraction: session.destinationFraction(destination),
-                color: session.destinationErrorCount(destination) > 0 ? .red : .green
+                color: session.destinationErrorCount(destination) > 0
+                    ? .red : state == .verifying ? .cyan : .blue
             )
             .frame(width: 26, height: 26)
         }
@@ -305,13 +360,16 @@ struct TransferCardView: View {
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Text("XXH64")
+                    Text(session.algorithm.displayName)
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.tertiary)
                 }
             }
             if !session.liveFailures.isEmpty {
                 failureList
+            }
+            if let report = session.report, !report.issues.isEmpty {
+                transferIssueList(report.issues)
             }
             if let report = session.report, report.status == .verified {
                 Label(
@@ -325,6 +383,16 @@ struct TransferCardView: View {
                 Label("Do not erase the source media.", systemImage: "exclamationmark.triangle.fill")
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.orange)
+            }
+            if let partialCleanupMessage = session.partialCleanupMessage {
+                Text(partialCleanupMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let ejectMessage {
+                Text(ejectMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             if session.showLog {
                 LogPanel(entries: session.logEntries)
@@ -347,7 +415,26 @@ struct TransferCardView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
-        .glassEffect(.regular.tint(.red.opacity(0.22)), in: .rect(cornerRadius: 10))
+        .background(.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.red.opacity(0.25)))
+    }
+
+    private func transferIssueList(_ issues: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("Transfer-level issue", systemImage: "exclamationmark.triangle.fill")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.red)
+            ForEach(issues, id: \.self) { issue in
+                Text(issue)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.red.opacity(0.22)))
     }
 
     private var actions: some View {
@@ -380,6 +467,35 @@ struct TransferCardView: View {
                     }
                     .buttonStyle(.glass)
                 }
+                if session.report?.status != .verified {
+                    Button {
+                        model.retryAsNewOffload(session)
+                    } label: {
+                        Label("Retry as New Offload", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.glassProminent)
+                    .tint(.blue)
+                    .help("Opens a reviewed preflight for a new output folder; existing files are untouched")
+                    if session.isRecovered {
+                        Button {
+                            session.cleanupGeneratedPartials()
+                        } label: {
+                            Label("Clean Temporary Files", systemImage: "sparkles")
+                        }
+                        .buttonStyle(.glass)
+                        .help("Removes only hidden staging files created by this interrupted transfer")
+                    }
+                } else if session.canEjectSource {
+                    Button {
+                        ejectSource()
+                    } label: {
+                        Label(isEjecting ? "Ejecting…" : "Eject Source", systemImage: "eject.fill")
+                    }
+                    .buttonStyle(.glassProminent)
+                    .tint(.green)
+                    .disabled(isEjecting)
+                    .help("Unmount and eject the verified source volume")
+                }
             }
             Button {
                 reveal(session.lastLogFileURL)
@@ -396,6 +512,23 @@ struct TransferCardView: View {
         guard let url else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
+
+    private func ejectSource() {
+        guard let sourceVolume = session.sourceVolume else { return }
+        isEjecting = true
+        ejectMessage = nil
+        Task {
+            do {
+                try NSWorkspace.shared.unmountAndEjectDevice(
+                    at: URL(fileURLWithPath: sourceVolume.mountPath, isDirectory: true)
+                )
+                ejectMessage = "Source safely ejected."
+            } catch {
+                ejectMessage = "Could not eject source: \(error.localizedDescription)"
+            }
+            isEjecting = false
+        }
+    }
 }
 
 // MARK: - Header decorations
@@ -403,17 +536,18 @@ struct TransferCardView: View {
 /// The little live dot: solid gray when finished, green with a soft radiating
 /// pulse while the transfer is running.
 struct StatusDot: View {
+    let color: Color
     let active: Bool
     @State private var pulsing = false
 
     var body: some View {
         Circle()
-            .fill(active ? Color.green : Color.secondary.opacity(0.5))
+            .fill(color)
             .frame(width: 8, height: 8)
             .overlay {
                 if active {
                     Circle()
-                        .stroke(.green.opacity(0.6), lineWidth: 1.5)
+                        .stroke(color.opacity(0.6), lineWidth: 1.5)
                         .scaleEffect(pulsing ? 2.6 : 1)
                         .opacity(pulsing ? 0 : 0.8)
                 }
@@ -429,14 +563,17 @@ struct StatusDot: View {
 /// The equalizer decoration on active cards — pure ornament, driven by a
 /// TimelineView so it needs no state.
 struct ActivityBars: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 20.0)) { context in
+        TimelineView(.animation(minimumInterval: reduceMotion ? 1 : 0.12, paused: reduceMotion)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             HStack(spacing: 2.5) {
                 ForEach(0..<7, id: \.self) { i in
                     Capsule()
-                        .fill(.green.opacity(0.75))
-                        .frame(width: 2.5, height: 3 + 11 * abs(sin(t * 2.3 + Double(i) * 0.9)))
+                        .fill(.blue.opacity(0.75))
+                        .frame(width: 2.5, height: reduceMotion
+                            ? 6 : 3 + 11 * abs(sin(t * 2.3 + Double(i) * 0.9)))
                 }
             }
         }
@@ -470,9 +607,11 @@ struct ProgressRing: View {
 /// status badge riding each curve — green check while clean, red cross the
 /// moment that destination has a failure.
 struct ConnectorView: View {
-    enum BadgeState {
+    enum BadgeState: Equatable {
         case pending
-        case ok
+        case copying
+        case verifying
+        case verified
         case problem
     }
 
@@ -518,7 +657,9 @@ struct ConnectorView: View {
     private func lineColor(_ state: BadgeState) -> Color {
         switch state {
         case .pending: .secondary.opacity(0.3)
-        case .ok: .green.opacity(0.55)
+        case .copying: .blue.opacity(0.55)
+        case .verifying: .cyan.opacity(0.6)
+        case .verified: .green.opacity(0.55)
         case .problem: .red.opacity(0.6)
         }
     }
@@ -530,10 +671,22 @@ struct ConnectorView: View {
             x: point.x - radius, y: point.y - radius,
             width: radius * 2, height: radius * 2
         ))
-        context.fill(circle, with: .color(state == .ok ? .green : .red))
-        let symbol = Text(Image(systemName: state == .ok ? "checkmark" : "xmark"))
-            .font(.system(size: 8, weight: .bold))
-            .foregroundColor(.white)
-        context.draw(symbol, at: point)
+        let color: Color = switch state {
+        case .pending: .secondary
+        case .copying: .blue
+        case .verifying: .cyan
+        case .verified: .green
+        case .problem: .red
+        }
+        context.fill(circle, with: .color(color))
+        if state == .verified || state == .problem {
+            let symbol = Text(Image(systemName: state == .verified ? "checkmark" : "xmark"))
+                .font(.system(size: 8, weight: .bold))
+                .foregroundColor(.white)
+            context.draw(symbol, at: point)
+        } else {
+            let inner = Path(ellipseIn: CGRect(x: point.x - 2, y: point.y - 2, width: 4, height: 4))
+            context.fill(inner, with: .color(.white))
+        }
     }
 }

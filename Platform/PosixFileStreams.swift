@@ -14,6 +14,8 @@ enum IOContext {
             return .noSpace
         case (EEXIST, _):
             return .alreadyExists
+        case (ESTALE, _):
+            return .sourceChanged
         case (ENOENT, _), (ENODEV, _), (ENXIO, _), (ENOTCONN, _), (ETIMEDOUT, _):
             // The file or its volume vanished out from under us.
             return .volumeGone

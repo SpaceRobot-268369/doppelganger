@@ -7,11 +7,17 @@ import Observation
 @MainActor
 @Observable
 final class TransferSession: Identifiable {
-    let id = UUID()
+    let id: UUID
+    let label: String
     let source: URL
+    let destinationBases: [URL]
     let destinations: [URL]
     let algorithm: ChecksumAlgorithm
-    let createdAt = Date()
+    let allowSameVolume: Bool
+    let availableBytesByDestination: [URL: Int64]
+    let createdAt: Date
+    let sourceVolume: FileSystemVolume?
+    let isRecovered: Bool
     private(set) var shortID = ""
 
     private(set) var progress = TransferProgress(phase: .enumerating)
@@ -24,6 +30,7 @@ final class TransferSession: Identifiable {
     private(set) var report: TransferReport?
     private(set) var lastLogFileURL: URL?
     private(set) var started = false
+    private(set) var partialCleanupMessage: String?
     var showLog = false
 
     /// Fired once, on the main actor, when the terminal report arrives — the
@@ -34,28 +41,129 @@ final class TransferSession: Identifiable {
     private var logStore: TransferLogStore?
     private var consumeTask: Task<Void, Never>?
     private var runStarted: Date?
+    private let journalStore: TransferJournalStore
+    private var journal: TransferJournal
 
     init(
+        id: UUID = UUID(),
+        label: String,
         source: URL,
-        destinations: [URL],
+        destinations: [TransferDestination],
         algorithm: ChecksumAlgorithm = .xxh64,
+        allowSameVolume: Bool = false,
+        createdAt: Date = Date(),
+        recoveredIssue: String? = nil,
         engine: TransferEngine? = nil
     ) {
+        self.id = id
+        self.label = label
         self.source = source
-        self.destinations = destinations
+        destinationBases = destinations.map(\.baseRoot)
+        self.destinations = destinations.map(\.outputRoot)
         self.algorithm = algorithm
+        self.allowSameVolume = allowSameVolume
+        self.createdAt = createdAt
+        isRecovered = recoveredIssue != nil
+        let fileSystem = RealFileSystem()
+        sourceVolume = try? fileSystem.volume(at: source)
+        availableBytesByDestination = Dictionary(uniqueKeysWithValues: destinations.compactMap {
+            guard let free = try? fileSystem.freeSpace(at: $0.baseRoot) else { return nil }
+            return ($0.outputRoot, free)
+        })
         self.engine = engine ?? TransferEngine(
             fileSystem: RealFileSystem(),
             sleepInhibitor: ProcessSleepInhibitor()
         )
+        journalStore = TransferJournalStore(root: Self.spoolDirectory)
+        journal = TransferJournal(
+            id: id,
+            label: label,
+            source: source,
+            destinationBases: destinations.map(\.baseRoot),
+            destinations: destinations.map(\.outputRoot),
+            algorithm: algorithm,
+            allowSameVolume: allowSameVolume,
+            createdAt: createdAt,
+            startedAt: nil,
+            itemCount: 0,
+            totalBytes: 0,
+            status: .queued
+        )
+
+        if let recoveredIssue {
+            started = true
+            shortID = String(id.uuidString.prefix(8)).lowercased()
+            planItemCount = journal.itemCount
+            planTotalBytes = journal.totalBytes
+            let possibleLocations = self.destinations + [
+                Self.spoolDirectory.appendingPathComponent(shortID, isDirectory: true)
+            ]
+            let evidenceLocations = possibleLocations.filter {
+                FileManager.default.fileExists(
+                    atPath: $0.appendingPathComponent(
+                        ManifestWriter.manifestFileName(shortID: shortID)
+                    ).path
+                )
+            }
+            report = TransferReport(
+                id: id,
+                status: .failed,
+                algorithm: algorithm,
+                sourceRoot: source,
+                destinations: self.destinations,
+                startedAt: createdAt,
+                finishedAt: Date(),
+                items: [],
+                manifestLocations: evidenceLocations,
+                issues: [recoveredIssue]
+            )
+        } else {
+            journalStore.save(journal)
+        }
+    }
+
+    convenience init(interrupted journal: TransferJournal) {
+        self.init(
+            id: journal.id,
+            label: journal.label,
+            source: journal.source,
+            destinations: zip(journal.destinationBases, journal.destinations).map {
+                TransferDestination(baseRoot: $0.0, outputRoot: $0.1)
+            },
+            algorithm: journal.algorithm,
+            allowSameVolume: journal.allowSameVolume,
+            createdAt: journal.createdAt,
+            recoveredIssue: "The app exited before this transfer produced a terminal report. Treat every output as incomplete and keep the source media."
+        )
+        planItemCount = journal.itemCount
+        planTotalBytes = journal.totalBytes
     }
 
     /// Not yet terminal: queued or running.
     var isActive: Bool { report == nil }
     var isQueued: Bool { !started && report == nil }
     var isRunning: Bool { started && report == nil }
+    var hasAttention: Bool {
+        !liveFailures.isEmpty || (report.map { $0.status != .verified } ?? false)
+    }
 
-    var displayName: String { source.lastPathComponent.uppercased() }
+    var displayName: String { label }
+    var sourceName: String { source.lastPathComponent.uppercased() }
+
+    func baseDestination(for output: URL) -> URL {
+        guard let index = destinations.firstIndex(of: output), destinationBases.indices.contains(index) else {
+            return output
+        }
+        return destinationBases[index]
+    }
+
+    /// Queue resources are volume identifiers, not folder paths.
+    var resourceIDs: Set<String> {
+        let fileSystem = RealFileSystem()
+        return Set(([source] + destinationBases).compactMap {
+            try? fileSystem.volume(at: $0).identifier
+        })
+    }
 
     // MARK: - Lifecycle
 
@@ -63,10 +171,15 @@ final class TransferSession: Identifiable {
         guard consumeTask == nil, report == nil else { return }
         started = true
         let request = TransferRequest(
+            id: id,
             sourceRoot: source,
-            destinationRoots: destinations,
+            destinations: zip(destinationBases, destinations).map {
+                TransferDestination(baseRoot: $0.0, outputRoot: $0.1)
+            },
             algorithm: algorithm,
-            spoolDirectory: Self.spoolDirectory
+            spoolDirectory: Self.spoolDirectory,
+            allowSameVolume: allowSameVolume,
+            requireNewOutputRoots: true
         )
         shortID = request.shortID
         let spoolTarget = Self.spoolDirectory.appendingPathComponent(request.shortID, isDirectory: true)
@@ -74,6 +187,9 @@ final class TransferSession: Identifiable {
         logStore = store
         lastLogFileURL = store.fileURL
         runStarted = Date()
+        journal.startedAt = runStarted
+        journal.status = .running
+        journalStore.save(journal)
 
         consumeTask = Task { [weak self, engine] in
             let stream = await engine.run(request)
@@ -96,9 +212,16 @@ final class TransferSession: Identifiable {
         switch event {
         case .phaseChanged(let phase):
             progress.phase = phase
+            if phase == .writingManifest {
+                journal.status = .finalizing
+                journalStore.save(journal)
+            }
         case .planReady(let itemCount, let totalBytes):
             planItemCount = itemCount
             planTotalBytes = totalBytes
+            journal.itemCount = itemCount
+            journal.totalBytes = totalBytes
+            journalStore.save(journal)
         case .progress(let snapshot):
             progress = snapshot
         case .itemOutcome(let relativePath, let destination, let outcome):
@@ -112,6 +235,12 @@ final class TransferSession: Identifiable {
             logStore?.close()
             logStore = nil
             report = finished
+            journal.status = switch finished.status {
+            case .verified: .verified
+            case .failed: .failed
+            case .cancelled: .cancelled
+            }
+            journalStore.save(journal)
             onFinished?()
         }
     }
@@ -178,14 +307,19 @@ final class TransferSession: Identifiable {
         if let report {
             switch report.status {
             case .verified: return ("Verified · Complete", false)
-            case .failed: return ("Failed · \(report.failedCount) copies did not verify", true)
+            case .failed:
+                if isRecovered { return ("Interrupted · Review required", true) }
+                if report.failedCount > 0 {
+                    return ("Failed · \(report.failedCount) copy result\(report.failedCount == 1 ? "" : "s") failed", true)
+                }
+                return ("Failed · transfer evidence incomplete", true)
             case .cancelled: return ("Cancelled · Incomplete", true)
             }
         }
         let percent = Int(overallFraction * 100)
         switch progress.phase {
         case .enumerating: return ("Scanning source…", false)
-        case .copying: return ("Copying & verifying · \(percent)%", false)
+        case .copying: return ("Copying · \(percent)%", false)
         case .verifying: return ("Verifying · \(percent)%", false)
         case .writingManifest: return ("Writing manifest…", false)
         case .done: return ("Finishing…", false)
@@ -219,7 +353,15 @@ final class TransferSession: Identifiable {
     }
 
     func destinationFraction(_ destination: URL) -> Double {
-        if report != nil { return 1 }
+        if let report {
+            guard planTotalBytes > 0 || !report.items.isEmpty else { return 0 }
+            let total = report.items.reduce(Int64(0)) { $0 + $1.item.size }
+            guard total > 0 else { return 0 }
+            let verified = report.items.reduce(Int64(0)) { value, item in
+                value + (item.outcomes[destination]?.isVerified == true ? item.item.size : 0)
+            }
+            return min(Double(verified) / Double(total), 1)
+        }
         switch progress.phase {
         case .enumerating:
             return 0
@@ -271,6 +413,39 @@ final class TransferSession: Identifiable {
         return report.destinations
             .map { $0.appendingPathComponent(MHLWriter.fileName(shortID: report.shortID)) }
             .first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    var canEjectSource: Bool {
+        guard report?.status == .verified, let sourceVolume else { return false }
+        return sourceVolume.isRemovable
+            && RealFileSystem().canonicalURL(source).path == sourceVolume.mountPath
+    }
+
+    /// Removes only hidden staging files generated by this transfer ID. Final
+    /// output names, manifests, logs, and source media are never candidates.
+    func cleanupGeneratedPartials() {
+        guard report != nil else { return }
+        let prefix = ".doppelganger-partial-\(shortID)-"
+        var removed = 0
+        var failures = 0
+        for destination in destinations {
+            guard let enumerator = FileManager.default.enumerator(
+                at: destination,
+                includingPropertiesForKeys: nil,
+                options: []
+            ) else { continue }
+            for case let url as URL in enumerator where url.lastPathComponent.hasPrefix(prefix) {
+                do {
+                    try FileManager.default.removeItem(at: url)
+                    removed += 1
+                } catch {
+                    failures += 1
+                }
+            }
+        }
+        partialCleanupMessage = failures == 0
+            ? "Removed \(removed) temporary file\(removed == 1 ? "" : "s")."
+            : "Removed \(removed) temporary files; \(failures) could not be removed."
     }
 
     static var spoolDirectory: URL {

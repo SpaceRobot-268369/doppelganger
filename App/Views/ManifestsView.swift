@@ -4,7 +4,33 @@ import SwiftUI
 /// Every manifest the app has ever written to its spool directory — the
 /// durable record that outlives sessions and app restarts.
 struct ManifestsView: View {
+    private enum StatusFilter: String, CaseIterable, Identifiable {
+        case all = "All"
+        case verified = "Verified"
+        case attention = "Needs Attention"
+
+        var id: String { rawValue }
+    }
+
+    @Bindable var model: AppModel
     @State private var entries: [SpoolManifest] = []
+    @State private var searchText = ""
+    @State private var statusFilter: StatusFilter = .all
+
+    private var filteredEntries: [SpoolManifest] {
+        entries.filter { entry in
+            let statusMatches = switch statusFilter {
+            case .all: true
+            case .verified: entry.status == "verified"
+            case .attention: entry.status != "verified"
+            }
+            let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let searchMatches = query.isEmpty
+                || entry.sourceName.localizedStandardContains(query)
+                || entry.id.localizedStandardContains(query)
+            return statusMatches && searchMatches
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -22,19 +48,25 @@ struct ManifestsView: View {
             .padding(.horizontal, 24)
             .padding(.top, 20)
 
-            if entries.isEmpty {
+            filterChips
+                .padding(.horizontal, 24)
+                .padding(.top, 14)
+
+            if filteredEntries.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: "doc.text")
                         .font(.system(size: 40, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Text("Every completed transfer leaves a manifest here.")
+                    Text(entries.isEmpty
+                         ? "Every completed transfer leaves a manifest here."
+                         : "No manifests match this search and filter.")
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 10) {
-                        ForEach(entries) { entry in
+                        ForEach(filteredEntries) { entry in
                             row(entry)
                         }
                     }
@@ -43,7 +75,43 @@ struct ManifestsView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .searchable(text: $searchText, prompt: "Source or transfer ID")
         .onAppear(perform: reload)
+        .onChange(of: model.completeCount) {
+            reload()
+        }
+    }
+
+    private var filterChips: some View {
+        HStack(spacing: 10) {
+            statusChip(.all, count: entries.count)
+            statusChip(
+                .verified,
+                count: entries.count { $0.status == "verified" },
+                dot: .green
+            )
+            statusChip(
+                .attention,
+                count: entries.count { $0.status != "verified" },
+                dot: .red
+            )
+            Spacer()
+        }
+    }
+
+    private func statusChip(
+        _ filter: StatusFilter,
+        count: Int,
+        dot: Color? = nil
+    ) -> some View {
+        SubtabFilterChip(
+            filter.rawValue,
+            count: count,
+            dot: dot,
+            isSelected: statusFilter == filter
+        ) {
+            statusFilter = filter
+        }
     }
 
     private func row(_ entry: SpoolManifest) -> some View {
@@ -69,15 +137,26 @@ struct ManifestsView: View {
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
             Button {
+                NSWorkspace.shared.activateFileViewerSelecting([entry.reportURL])
+            } label: {
+                Image(systemName: "doc.richtext")
+            }
+            .buttonStyle(.glass)
+            .help("Reveal report in Finder")
+            .accessibilityLabel("Reveal report in Finder")
+            .disabled(!FileManager.default.fileExists(atPath: entry.reportURL.path))
+            Button {
                 NSWorkspace.shared.activateFileViewerSelecting([entry.manifestURL])
             } label: {
                 Image(systemName: "magnifyingglass")
             }
             .buttonStyle(.glass)
             .help("Reveal manifest in Finder")
+            .accessibilityLabel("Reveal manifest in Finder")
         }
         .padding(14)
-        .glassEffect(.regular, in: .rect(cornerRadius: 14))
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(.separator.opacity(0.4)))
     }
 
     private func reload() {
@@ -89,6 +168,7 @@ struct ManifestsView: View {
 struct SpoolManifest: Identifiable {
     let id: String
     let manifestURL: URL
+    let reportURL: URL
     let status: String
     let sourceName: String
     let summaryLine: String
@@ -141,6 +221,11 @@ struct SpoolManifest: Identifiable {
             entries.append(SpoolManifest(
                 id: manifest.transferID,
                 manifestURL: manifestURL,
+                reportURL: dir.appendingPathComponent(
+                    ManifestWriter.reportFileName(
+                        shortID: String(manifest.transferID.prefix(8)).lowercased()
+                    )
+                ),
                 status: manifest.status,
                 sourceName: URL(fileURLWithPath: manifest.sourceRoot).lastPathComponent,
                 summaryLine: "\(summary.itemCount) files · \(Format.bytes(summary.totalBytes))"

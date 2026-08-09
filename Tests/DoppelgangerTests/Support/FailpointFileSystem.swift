@@ -16,7 +16,9 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
     private var goneAfterReadBudgets: [String: Int] = [:]  // root path → readable bytes before the volume "vanishes"
     private var goneAfterWriteBudgets: [String: Int] = [:] // root path → writable bytes before the volume "vanishes"
     private var unreadableSuffixes: Set<String> = []
+    private var changedSourceSuffixes: Set<String> = []
     private var freeSpaceOverrides: [String: Int64] = [:]
+    private var evidenceWriteFailureRoots: Set<String> = []
     private var readDelayMicros: UInt32 = 0
     private var writeDelayMicros: UInt32 = 0
 
@@ -29,7 +31,7 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
     /// Flip the first byte of the first chunk written to any path with this
     /// suffix — produces a checksum mismatch on read-back at exactly one file.
     func corruptFirstByteOnWrite(pathSuffix: String) {
-        withLock { corruptOnWriteSuffixes.insert(pathSuffix) }
+        _ = withLock { corruptOnWriteSuffixes.insert(pathSuffix) }
     }
 
     /// Writes under `root` throw `.noSpace` once `bytes` have been written.
@@ -55,11 +57,19 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
 
     /// Opening any path with this suffix for reading throws `.notReadable`.
     func markUnreadable(pathSuffix: String) {
-        withLock { unreadableSuffixes.insert(pathSuffix) }
+        _ = withLock { unreadableSuffixes.insert(pathSuffix) }
+    }
+
+    func markSourceChanged(pathSuffix: String) {
+        _ = withLock { changedSourceSuffixes.insert(pathSuffix) }
     }
 
     func overrideFreeSpace(at root: URL, bytes: Int64) {
         withLock { freeSpaceOverrides[root.path] = bytes }
+    }
+
+    func failEvidenceWrites(under root: URL) {
+        _ = withLock { evidenceWriteFailureRoots.insert(root.path) }
     }
 
     /// Slow every chunk down so cancellation tests have a deterministic
@@ -77,6 +87,23 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
     func enumerate(root: URL) throws -> [SourceItem] {
         if isGone(root.path) { throw FileSystemError.volumeGone }
         return try base.enumerate(root: root)
+    }
+
+    func canonicalURL(_ url: URL) -> URL { base.canonicalURL(url) }
+
+    func volume(at url: URL) throws -> FileSystemVolume { try base.volume(at: url) }
+
+    func sourceItem(at url: URL, relativeTo root: URL) throws -> SourceItem {
+        if isGone(url.path) { throw FileSystemError.volumeGone }
+        let item = try base.sourceItem(at: url, relativeTo: root)
+        if withLock({ changedSourceSuffixes.contains { url.path.hasSuffix($0) } }) {
+            return SourceItem(
+                relativePath: item.relativePath,
+                size: item.size + 1,
+                modificationTime: item.modificationTime
+            )
+        }
+        return item
     }
 
     func fileExists(at url: URL) -> Bool {
@@ -101,8 +128,15 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
     func openForWritingExclusive(_ url: URL) throws -> any FileWriteStream {
         let path = url.path
         if isGone(path) { throw FileSystemError.volumeGone }
+        let logicalPath = logicalTargetPath(for: path)
+        if withLock({ evidenceWriteFailureRoots.contains { covered(path, by: $0) } }),
+           URL(fileURLWithPath: logicalPath).lastPathComponent.hasPrefix("doppelganger-") {
+            throw FileSystemError.noSpace
+        }
         let corrupt = withLock { () -> Bool in
-            if let suffix = corruptOnWriteSuffixes.first(where: { path.hasSuffix($0) }) {
+            if let suffix = corruptOnWriteSuffixes.first(where: {
+                path.hasSuffix($0) || logicalPath.hasSuffix($0)
+            }) {
                 corruptOnWriteSuffixes.remove(suffix)
                 return true
             }
@@ -114,6 +148,11 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
             owner: self,
             corruptFirstByte: corrupt
         )
+    }
+
+    func moveItemExclusive(from staging: URL, to final: URL) throws {
+        if isGone(staging.path) || isGone(final.path) { throw FileSystemError.volumeGone }
+        try base.moveItemExclusive(from: staging, to: final)
     }
 
     func removeItem(at url: URL) throws {
@@ -179,6 +218,20 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
 
     private func covered(_ path: String, by root: String) -> Bool {
         path == root || path.hasPrefix(root + "/")
+    }
+
+    /// Production writes through `.doppelganger-partial-<id>-<name>` and then
+    /// atomically publishes the file. Fault controls still target the final
+    /// logical filename so tests exercise that production path.
+    private func logicalTargetPath(for path: String) -> String {
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent
+        let marker = ".doppelganger-partial-"
+        guard name.hasPrefix(marker) else { return path }
+        let remainder = name.dropFirst(marker.count)
+        guard remainder.count > 9 else { return path }
+        let originalName = remainder.dropFirst(9) // eight-char ID plus '-'
+        return url.deletingLastPathComponent().appendingPathComponent(String(originalName)).path
     }
 
     private func isGone(_ path: String) -> Bool {

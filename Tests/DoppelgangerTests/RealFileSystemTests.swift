@@ -31,9 +31,10 @@ struct RealFileSystemTests {
             .init("clip.mov", size: 10, seed: 1),
             .init(".DS_Store", size: 10, seed: 2),
             .init(".Spotlight-V100/store.db", size: 10, seed: 3),
+            .init(".camera-settings", size: 10, seed: 4),
         ])
         let items = try fs.enumerate(root: card)
-        #expect(items.map(\.relativePath) == ["clip.mov"])
+        #expect(items.map(\.relativePath) == [".camera-settings", "clip.mov"])
     }
 
     @Test func enumeratingAMissingRootThrowsVolumeGone() throws {

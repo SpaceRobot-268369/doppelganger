@@ -1,8 +1,9 @@
 import SwiftUI
 
 struct MainView: View {
-    @State private var model = AppModel()
+    @Bindable var model: AppModel
     @AppStorage("prefs.autoShowLog") private var autoShowLog = false
+    @AppStorage(AppearancePreference.storageKey) private var appearance = AppearancePreference.system
 
     var body: some View {
         NavigationSplitView {
@@ -11,9 +12,11 @@ struct MainView: View {
         } detail: {
             detail
         }
+        .navigationSplitViewStyle(.balanced)
         .sheet(isPresented: $model.showingNewOffload) {
             NewOffloadSheet(model: model, autoShowLog: autoShowLog)
         }
+        .preferredColorScheme(appearance.colorScheme)
     }
 
     @ViewBuilder
@@ -26,11 +29,13 @@ struct MainView: View {
         case .destinations:
             DestinationsView(model: model)
         case .manifests:
-            ManifestsView()
+            ManifestsView(model: model)
+        case .preferences:
+            PreferencesView()
         }
     }
 }
 
 #Preview {
-    MainView()
+    MainView(model: AppModel())
 }

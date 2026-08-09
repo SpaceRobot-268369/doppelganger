@@ -1,5 +1,47 @@
 import Foundation
 
+/// Stable-enough identity and capacity information for the volume containing a
+/// path. A path alone is not proof that two destinations are independent disks.
+public struct FileSystemVolume: Sendable, Hashable, Codable {
+    public let identifier: String
+    public let name: String
+    public let mountPath: String
+    public let fileSystem: String?
+    public let availableBytes: Int64?
+    public let totalBytes: Int64?
+    public let isRemovable: Bool
+    public let isReadOnly: Bool
+    public let supportsCaseSensitiveNames: Bool?
+    public let maximumNameBytes: Int?
+    public let maximumPathBytes: Int?
+
+    public init(
+        identifier: String,
+        name: String,
+        mountPath: String,
+        fileSystem: String? = nil,
+        availableBytes: Int64? = nil,
+        totalBytes: Int64? = nil,
+        isRemovable: Bool = false,
+        isReadOnly: Bool = false,
+        supportsCaseSensitiveNames: Bool? = nil,
+        maximumNameBytes: Int? = nil,
+        maximumPathBytes: Int? = nil
+    ) {
+        self.identifier = identifier
+        self.name = name
+        self.mountPath = mountPath
+        self.fileSystem = fileSystem
+        self.availableBytes = availableBytes
+        self.totalBytes = totalBytes
+        self.isRemovable = isRemovable
+        self.isReadOnly = isReadOnly
+        self.supportsCaseSensitiveNames = supportsCaseSensitiveNames
+        self.maximumNameBytes = maximumNameBytes
+        self.maximumPathBytes = maximumPathBytes
+    }
+}
+
 /// Core's only window onto storage. Platform implements it with real POSIX
 /// I/O; tests implement or decorate it with scratch-directory fakes and fault
 /// injection. Core never touches `FileManager` directly.
@@ -8,6 +50,16 @@ public protocol FileSystemAccess: Sendable {
     /// in a deterministic sorted order. Must never mutate anything beneath
     /// `root` — the source stays read-only, `.DS_Store` included.
     func enumerate(root: URL) throws -> [SourceItem]
+
+    /// Resolve aliases/symlinks for safety comparisons. For a not-yet-created
+    /// output path, implementations resolve the nearest existing ancestor.
+    func canonicalURL(_ url: URL) -> URL
+
+    /// Identity of the physical/logical mounted volume containing `url`.
+    func volume(at url: URL) throws -> FileSystemVolume
+
+    /// Current size and modification time for one regular source file.
+    func sourceItem(at url: URL, relativeTo root: URL) throws -> SourceItem
 
     func fileExists(at url: URL) -> Bool
 
@@ -21,6 +73,10 @@ public protocol FileSystemAccess: Sendable {
     /// Open a brand-new file for writing (exclusive create). An existing file
     /// throws `FileSystemError.alreadyExists` — the engine's name collision.
     func openForWritingExclusive(_ url: URL) throws -> any FileWriteStream
+
+    /// Atomically publish a fully flushed staging file without overwriting an
+    /// existing final path.
+    func moveItemExclusive(from staging: URL, to final: URL) throws
 
     /// Remove a single file. The engine only ever calls this to clean up a
     /// partial destination copy — never under a source root.

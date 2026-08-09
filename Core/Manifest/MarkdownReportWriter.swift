@@ -23,6 +23,13 @@ public enum MarkdownReportWriter {
         lines.append("| Checksum | \(manifest.algorithm) |")
         lines.append("")
 
+        if let issues = manifest.issues, !issues.isEmpty {
+            lines.append("## ⚠️ Transfer issues")
+            lines.append("")
+            for issue in issues { lines.append("- \(escape(issue))") }
+            lines.append("")
+        }
+
         let problems = problemRows(in: manifest)
         if !problems.isEmpty {
             lines.append("## ⚠️ Problems — \(problems.count) file/destination pair(s) did NOT verify")
