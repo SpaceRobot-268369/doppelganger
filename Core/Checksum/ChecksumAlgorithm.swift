@@ -5,12 +5,22 @@ public enum ChecksumAlgorithm: String, Codable, Sendable, CaseIterable {
     /// Digest renders as 16 lowercase hex chars, big-endian (`xxh64be` convention).
     case xxh64
 
-    // An `md5` case is planned for MHL/facility compatibility (feature register
-    // P1); it is intentionally absent from the MVP.
+    /// Compatibility only, for MHL workflows and facilities that require MD5.
+    /// Digest renders as 32 lowercase hex chars. Slower than xxh64.
+    case md5
 
     public func makeHasher() -> any StreamingHasher {
         switch self {
         case .xxh64: XXHash64()
+        case .md5: MD5()
+        }
+    }
+
+    /// User-facing name.
+    public var displayName: String {
+        switch self {
+        case .xxh64: "xxHash64"
+        case .md5: "MD5"
         }
     }
 }

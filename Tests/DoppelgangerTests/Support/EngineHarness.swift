@@ -23,6 +23,7 @@ enum EngineHarness {
         source: URL,
         destinations: [URL],
         spool: URL,
+        algorithm: ChecksumAlgorithm = .xxh64,
         chunkSize: Int = 64 * 1024,
         cancelWhen: (@Sendable (TransferEvent) -> Bool)? = nil
     ) async throws -> Run {
@@ -30,7 +31,9 @@ enum EngineHarness {
             fileSystem: fileSystem,
             configuration: TransferConfiguration(chunkSize: chunkSize, progressInterval: .milliseconds(1))
         )
-        let request = TransferRequest(sourceRoot: source, destinationRoots: destinations, spoolDirectory: spool)
+        let request = TransferRequest(
+            sourceRoot: source, destinationRoots: destinations,
+            algorithm: algorithm, spoolDirectory: spool)
         var events: [TransferEvent] = []
         var report: TransferReport?
         var cancelSent = false
