@@ -429,13 +429,14 @@ struct TransferWorker {
         var locations: [URL] = []
         if writeToDestinations {
             for destination in request.destinationRoots {
-                if await writeRecords(json: json, markdown: markdown, to: destination, createFirst: false) {
+                let mhl = MHLWriter.xml(for: provisional, destination: destination)
+                if await writeRecords(json: json, markdown: markdown, mhl: mhl, to: destination, createFirst: false) {
                     locations.append(destination)
                 }
             }
         }
         let spoolTarget = request.spoolDirectory.appendingPathComponent(request.shortID, isDirectory: true)
-        if await writeRecords(json: json, markdown: markdown, to: spoolTarget, createFirst: true) {
+        if await writeRecords(json: json, markdown: markdown, mhl: nil, to: spoolTarget, createFirst: true) {
             locations.append(spoolTarget)
         }
 
@@ -452,13 +453,16 @@ struct TransferWorker {
         await hub.finished(report)
     }
 
-    private func writeRecords(json: Data?, markdown: String, to root: URL, createFirst: Bool) async -> Bool {
+    private func writeRecords(json: Data?, markdown: String, mhl: String?, to root: URL, createFirst: Bool) async -> Bool {
         do {
             if createFirst { try fileSystem.createDirectory(at: root) }
             if let json {
                 try writeFile(Array(json), to: root.appendingPathComponent(ManifestWriter.manifestFileName(shortID: request.shortID)))
             }
             try writeFile(Array(markdown.utf8), to: root.appendingPathComponent(ManifestWriter.reportFileName(shortID: request.shortID)))
+            if let mhl {
+                try writeFile(Array(mhl.utf8), to: root.appendingPathComponent(MHLWriter.fileName(shortID: request.shortID)))
+            }
             return true
         } catch {
             await hub.log(.error, "Could not write manifest to \(root.path): \(describe(error))")
