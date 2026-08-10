@@ -1,0 +1,359 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1A0000000000000000000021 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 1A0000000000000000000022 /* GRDB */; };
+		1A0000000000000000000024 /* xxHash-Swift in Frameworks */ = {isa = PBXBuildFile; productRef = 1A0000000000000000000025 /* xxHash-Swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		1A0000000000000000000016 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1A0000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1A0000000000000000000002;
+			remoteInfo = Doppelganger;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		1A0000000000000000000004 /* Doppelganger.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Doppelganger.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1A0000000000000000000005 /* DoppelgangerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DoppelgangerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		1A000000000000000000000D /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
+		1A000000000000000000000E /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
+		1A000000000000000000000F /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Release.xcconfig; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		1A0000000000000000000008 /* App */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = App;
+			sourceTree = "<group>";
+		};
+		1A0000000000000000000009 /* Core */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Core;
+			sourceTree = "<group>";
+		};
+		1A000000000000000000000A /* Platform */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Platform;
+			sourceTree = "<group>";
+		};
+		1A000000000000000000000B /* DoppelgangerTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "Tests/DoppelgangerTests";
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		1A0000000000000000000011 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1A0000000000000000000021 /* GRDB in Frameworks */,
+				1A0000000000000000000024 /* xxHash-Swift in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1A0000000000000000000014 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		1A0000000000000000000006 = {
+			isa = PBXGroup;
+			children = (
+				1A0000000000000000000008 /* App */,
+				1A0000000000000000000009 /* Core */,
+				1A000000000000000000000A /* Platform */,
+				1A000000000000000000000B /* DoppelgangerTests */,
+				1A000000000000000000000C /* Configs */,
+				1A0000000000000000000007 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		1A0000000000000000000007 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1A0000000000000000000004 /* Doppelganger.app */,
+				1A0000000000000000000005 /* DoppelgangerTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		1A000000000000000000000C /* Configs */ = {
+			isa = PBXGroup;
+			children = (
+				1A000000000000000000000D /* Base.xcconfig */,
+				1A000000000000000000000E /* Debug.xcconfig */,
+				1A000000000000000000000F /* Release.xcconfig */,
+			);
+			path = Configs;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1A0000000000000000000002 /* Doppelganger */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1A000000000000000000001B /* Build configuration list for PBXNativeTarget "Doppelganger" */;
+			buildPhases = (
+				1A0000000000000000000010 /* Sources */,
+				1A0000000000000000000011 /* Frameworks */,
+				1A0000000000000000000012 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				1A0000000000000000000008 /* App */,
+				1A0000000000000000000009 /* Core */,
+				1A000000000000000000000A /* Platform */,
+			);
+			name = Doppelganger;
+			packageProductDependencies = (
+				1A0000000000000000000022 /* GRDB */,
+				1A0000000000000000000025 /* xxHash-Swift */,
+			);
+			productName = Doppelganger;
+			productReference = 1A0000000000000000000004 /* Doppelganger.app */;
+			productType = "com.apple.product-type.application";
+		};
+		1A0000000000000000000003 /* DoppelgangerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1A000000000000000000001E /* Build configuration list for PBXNativeTarget "DoppelgangerTests" */;
+			buildPhases = (
+				1A0000000000000000000013 /* Sources */,
+				1A0000000000000000000014 /* Frameworks */,
+				1A0000000000000000000015 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				1A0000000000000000000017 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				1A000000000000000000000B /* DoppelgangerTests */,
+			);
+			name = DoppelgangerTests;
+			packageProductDependencies = (
+			);
+			productName = DoppelgangerTests;
+			productReference = 1A0000000000000000000005 /* DoppelgangerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1A0000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 2630;
+				TargetAttributes = {
+					1A0000000000000000000003 = {
+						TestTargetID = 1A0000000000000000000002;
+					};
+				};
+			};
+			buildConfigurationList = 1A0000000000000000000018 /* Build configuration list for PBXProject "Doppelganger" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				"zh-Hans",
+				Base,
+			);
+			mainGroup = 1A0000000000000000000006;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			packageReferences = (
+				1A0000000000000000000023 /* XCRemoteSwiftPackageReference "GRDB.swift" */,
+				1A0000000000000000000026 /* XCRemoteSwiftPackageReference "xxHash-Swift" */,
+			);
+			productRefGroup = 1A0000000000000000000007 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1A0000000000000000000002 /* Doppelganger */,
+				1A0000000000000000000003 /* DoppelgangerTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		1A0000000000000000000012 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1A0000000000000000000015 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		1A0000000000000000000010 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1A0000000000000000000013 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		1A0000000000000000000017 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1A0000000000000000000002 /* Doppelganger */;
+			targetProxy = 1A0000000000000000000016 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		1A0000000000000000000019 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 1A000000000000000000000E /* Debug.xcconfig */;
+			buildSettings = {
+			};
+			name = Debug;
+		};
+		1A000000000000000000001A /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 1A000000000000000000000F /* Release.xcconfig */;
+			buildSettings = {
+			};
+			name = Release;
+		};
+		1A000000000000000000001C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		1A000000000000000000001D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+		1A000000000000000000001F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.lucastao.doppelganger.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Doppelganger.app/Contents/MacOS/Doppelganger";
+			};
+			name = Debug;
+		};
+		1A0000000000000000000020 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.lucastao.doppelganger.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Doppelganger.app/Contents/MacOS/Doppelganger";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		1A0000000000000000000018 /* Build configuration list for PBXProject "Doppelganger" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A0000000000000000000019 /* Debug */,
+				1A000000000000000000001A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1A000000000000000000001B /* Build configuration list for PBXNativeTarget "Doppelganger" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A000000000000000000001C /* Debug */,
+				1A000000000000000000001D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1A000000000000000000001E /* Build configuration list for PBXNativeTarget "DoppelgangerTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A000000000000000000001F /* Debug */,
+				1A0000000000000000000020 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		1A0000000000000000000023 /* XCRemoteSwiftPackageReference "GRDB.swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/groue/GRDB.swift.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 7.11.1;
+			};
+		};
+		1A0000000000000000000026 /* XCRemoteSwiftPackageReference "xxHash-Swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/SylvanG/xxHash-Swift.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.2;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		1A0000000000000000000022 /* GRDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 1A0000000000000000000023 /* XCRemoteSwiftPackageReference "GRDB.swift" */;
+			productName = GRDB;
+		};
+		1A0000000000000000000025 /* xxHash-Swift */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 1A0000000000000000000026 /* XCRemoteSwiftPackageReference "xxHash-Swift" */;
+			productName = "xxHash-Swift";
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 1A0000000000000000000001 /* Project object */;
+}

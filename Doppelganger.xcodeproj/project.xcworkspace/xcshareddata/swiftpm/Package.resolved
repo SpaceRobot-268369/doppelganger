@@ -1,0 +1,24 @@
+{
+  "originHash" : "f5700b6e3a3d3627f6e51068305db2f9bd63dd1285b3ebbbcc6bc97615bcb970",
+  "pins" : [
+    {
+      "identity" : "grdb.swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/groue/GRDB.swift.git",
+      "state" : {
+        "revision" : "b83108d10f42680d78f23fe4d4d80fc88dab3212",
+        "version" : "7.11.1"
+      }
+    },
+    {
+      "identity" : "xxhash-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/SylvanG/xxHash-Swift.git",
+      "state" : {
+        "revision" : "2a109f60f6b5e91798368d4df2c525427e6afafd",
+        "version" : "1.0.2"
+      }
+    }
+  ],
+  "version" : 3
+}

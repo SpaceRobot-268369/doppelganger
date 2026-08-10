@@ -1,88 +1,103 @@
-# Features
+# Feature Register
 
-The living feature register for doppelganger. It records the category baseline
-set by Hedge/OffShoot, the product decision for doppelganger, and actual
-development progress. Update it whenever a feature is accepted, deferred,
-implemented, or materially changed.
+Stable, numbered product decisions for doppelganger. IDs never get reused. A
+feature can move between milestones, but its meaning stays stable so product
+discussion, code, tests, and release notes can refer to the same capability.
+The correctness contract in [`offload-model.md`](offload-model.md) remains
+authoritative whenever a feature affects copying, verification, or evidence.
 
-This is a planning and progress document. The safety and correctness guarantees
-for anything that copies or verifies media remain authoritative in
-[`offload-model.md`](offload-model.md).
-
-## Status legend
+## Status
 
 | Status | Meaning |
 |---|---|
-| `specified` | Defined in product documentation, but no implementation exists yet. |
-| `planned` | Accepted for a future milestone; its detailed design may still be open. |
-| `deferred` | Intentionally outside the current product scope. |
-| `implemented` | Shipped and verified in the application. |
-| `blocked` | Accepted, but waiting on a dependency or decision. |
+| `implemented` | Present in the current application and covered by acceptance tests. |
+| `accepted-1.0` | Required for the complete public 1.0 release. |
+| `later` | Accepted after 1.0. |
+| `parked` | Intentionally inactive with no scheduled milestone. |
+| `not-planned` | Explicit product decision not to build this capability. |
 
-## Current product features
+## Product features
 
-| Feature | Priority | Status | Scope and acceptance bar |
-|---|---:|---|---|
-| Multi-destination offload | P0 | `specified` | Copy one read-only camera-card source to one or more destinations; every required destination must succeed. |
-| Streaming checksum verification | P0 | `specified` | Hash the source while copying, then independently read back and hash each destination. A copied-but-unverified item is not successful. |
-| Transfer manifest and logs | P0 | `specified` | Record each item's relative path, size, hash algorithm and digest, destination, timestamps, and result. Target MHL compatibility. |
-| Honest result reporting | P0 | `specified` | Per-file, per-destination results; any required-destination failure fails the transfer. |
-| Source and destination selection | P0 | `specified` | Choose source volumes/folders and destinations, and persist selections across launches. |
-| Transfer progress | P0 | `specified` | Show preparation, copy, verification, and final result distinctly; never imply verification at the end of copying. |
-| Interruption handling | P0 | `specified` | Handle unmounted sources/destinations, full disks, unreadable files, sleep, and checksum mismatches with a defined failed result and manifest. |
-| Compatibility checksums | P1 | `specified` | Use xxHash64 by default; support MD5 when an MHL workflow or facility requires it. |
-| Resume / retry | P1 | `planned` | Safely restart an interrupted transfer; incomplete or unverified destination files must be replaced and verified again. |
-| Duplicate and collision handling | P1 | `planned` | Detect already-complete items and safely handle name, case-sensitivity, path-length, and filesystem conflicts. |
-| Labels, naming, and destination templates | P1 | `planned` | Project/card labels, counters, dates, custom fields, and reproducible destination-folder rules. |
-| Presets | P1 | `planned` | Save and share a complete offload configuration, including organization rules and verification policy. |
-| Selective copy and organization | P1 | `planned` | Include/exclude patterns, safe empty-folder/bundle handling, flattening, renaming, and metadata-based sorting. |
-| Queue and throughput policy | P1 | `planned` | Control concurrency and prioritize the fastest useful destination without compromising verification. |
-| MHL re-verification | P2 | `planned` | Verify an existing MHL without a new copy; report missing files and hash mismatches. |
-| Cascading transfers | P2 | `planned` | After a verified primary offload, create a separately tracked onward copy to another storage tier. |
-| Remote transfer monitoring | P2 | `planned` | Read-only live progress and completion/failure notifications. |
-| Automation API and scripts | P2 | `planned` | Emit explicit transfer lifecycle events with structured result data. |
-| S3/object-storage destinations | P2 | `deferred` | Not part of the initial local-media-offload product. |
-| Media browsing, playback, transcoding, proxies | P2 | `deferred` | These are separate workflow products, not evidence that an offload is safe. |
-| Card formatting, source deletion, or moving source media | — | `deferred` | Not in the initial product. No source must be altered by an offload; see [Principle 3](../../../AGENTS.md#principles). |
+| ID | Feature | Status | Acceptance boundary |
+|---|---|---|---|
+| F01 | Pause and resume | `implemented` | Pause at a safe boundary; resume whole files in a new linked attempt without rewriting prior evidence. |
+| F02 | Verified duplicate detection | `implemented` | Metadata finds candidates; only an independently matching digest permits a skip. |
+| F03 | Fine-grained retry | `implemented` | Retry failed files or destinations in a new linked attempt. |
+| F04 | Verification profiles | `implemented` | Fast, Standard, and Maximum have visibly different read policies and truthful terminal states. |
+| F05 | Checksum selection | `implemented` | Settings-only single selection: XXH3-64 default, XXH64BE, or MD5; each task snapshots it. |
+| F06 | Standalone verification | `implemented` | Verify existing media without copying and retain the result as an immutable attempt. |
+| F07 | Full ASC MHL | `implemented` | Native Swift read/write, generations, chains, directory hashes, and conformance fixtures. |
+| F08 | MHL import and Verify Again | `implemented` | Import/drag an ASC MHL and emit a new verification result for missing, added, or mismatched files. |
+| F09 | Source MHL awareness | `implemented` | Reuse trusted source digests only when chain, schema, size, time, and source identity match. |
+| F10 | Multi-source batch | `implemented` | Review and enqueue independent plans for several sources at once. |
+| F11 | Manual queue controls | `implemented` | Reorder, prioritize, pause, resume, and cancel without hidden automatic rules. |
+| F12 | Queue automation rules | `not-planned` | No watched folders, auto-add, or auto-start rules. |
+| F13 | Cascading transfers | `implemented` | A verified destination can become a source for a separately evidenced onward task. |
+| F14 | Destination groups | `implemented` | Named, reusable sets of destinations with explicit roles. |
+| F15 | Presets | `implemented` | Versioned reusable transfer policy and output-plan configuration. |
+| F16 | Folder naming templates | `implemented` | Validated project/day/camera/card/counter tokens with exact output previews. |
+| F17 | Selective copy | `not-planned` | A transfer includes the complete reviewed source plan. |
+| F18 | Flatten, rename, or reorganize media | `not-planned` | Relative source paths remain intact; only the enclosing task folder is templated. |
+| F19 | Optional Project library | `implemented` | Tasks may use a Project or remain in No Project/All Transfers. |
+| F20 | Shooting day, camera, and card organization | `implemented` | History groups without mutating immutable transfer evidence. |
+| F21 | Card identity | `implemented` | Stable volume facts plus a deterministic source-plan fingerprint. |
+| F22 | Already-offloaded warning | `implemented` | Show prior verified destinations and distinguish unchanged, changed, and merely similar cards. |
+| F23 | Destination Library | `implemented` | Persist identity, role, capacity observations, benchmark, and verified history. |
+| F24 | Advanced history | `implemented` | Search and filter task/attempt/evidence history by project, operator, media, state, date, or destination. |
+| F25 | Durable database | `implemented` | GRDB/SQLite is the indexed catalog; evidence files remain portable source artifacts. |
+| F26 | PDF, CSV, and HTML handoff reports | `later` | Human-readable aggregate reporting after 1.0. |
+| F27 | Contact sheet | `implemented` | Optional post-verify JPEG; global default off plus manual generation; failure is an auxiliary warning. |
+| F28 | Camera metadata analysis | `implemented` | Read useful production metadata without mutating media. |
+| F29 | Media health checks | `implemented` | Detect structure, sidecar, sequence, split-clip, readability, zero-byte, and timestamp findings. |
+| F30 | Camera format coverage | `implemented` | Pluggable detection for common ARRI, RED, Sony, Canon, Blackmagic, Codex, and audio-recorder layouts. |
+| F31 | Live drive performance | `implemented` | Per-destination throughput, ETA, and bottleneck reporting. |
+| F32 | Adaptive transfer pipeline | `implemented` | One bounded producer and independent destination writers; no unbounded buffering. |
+| F33 | Destination benchmark | `implemented` | Manual, cached, disposable-file benchmark that never touches a source. |
+| F34 | Automation API, CLI, and MCP | `later` | Explicit local automation surface; MCP is evaluated with the API design. |
+| F35 | Remote monitoring | `parked` | Browser or phone progress is outside 1.0. |
+| F36 | Remote notifications | `parked` | No Slack, email, or push; local macOS notifications remain. |
+| F37 | Cloud destinations | `parked` | Local mounted storage only. |
+| F38 | NLE metadata export | `parked` | No production metadata interchange in 1.0. |
+| F39 | First-launch onboarding | `implemented` | Explain the workflow and establish the first local operator profile. |
+| F40 | Permission guidance | `implemented` | Explain and diagnose macOS file-access permissions without claiming access the app lacks. |
+| F41 | Sample/demo workflow | `implemented` | Create and offload synthetic temporary fixtures only. |
+| F42 | In-app Help | `implemented` | Searchable workflow, status, safety, troubleshooting, and evidence guidance. |
+| F43 | Localization | `implemented` | English and Simplified Chinese UI, errors, evidence labels, and Help. |
+| F44 | Full accessibility completion | `parked` | Preserve current labels and Reduce Motion support; a complete audit is post-1.0. |
+| F45 | Settings import/export | `implemented` | Versioned package for settings, presets, logical destinations, profiles, and avatar assets; never history/evidence. |
+| F46 | Operator Profiles | `implemented` | Multiple local, non-authenticated profiles with avatars; attempts and state-changing audit events snapshot the selected operator. |
 
-## Hedge / OffShoot reference baseline
+## Existing foundation
 
-Hedge's current offload product is named **OffShoot**. The entries below are
-reference capabilities, not commitments to ship every feature. They are grouped
-to make comparison and prioritization straightforward.
+Implementation snapshot (2026-08-10): the complete selected 1.0 feature set
+builds in Debug and Release, and the synthetic acceptance suite passes 93 tests
+across transfer safety, evidence, database, media analysis, localization, and
+workflow foundations. Hardware-matrix and signed/notarized distribution checks
+remain release validation rather than product feature work.
 
-| Area | Hedge / OffShoot capability | doppelganger decision |
-|---|---|---|
-| Transfer engine | Multiple sources and multiple destinations; simultaneous verified transfers from disks, folders, and mounted volumes. | P0 multi-destination local offload; multi-source batching can follow. |
-| Verification | Transfer, source, and source-and-destination verification modes; XXH64BE by default; optional MD5, SHA-1, and C4; missing-file and zero-byte-media detection. | P0 source-to-destination read-back verification, xxHash64 and MD5; additional modes and legacy hashes later. |
-| Evidence | Transfer Logs, MHL/ASC MHL support, automatic MHL checks, manual and batch MHL verification. | P0 manifest/logs and MHL target; MHL re-verification is P2. |
-| Organization | Labels, custom elements, folder and filename formats, counters, timestamps, selective copying, bundle/folder exclusion, flattening, and presets. | P1. |
-| Continuity | Duplicate detection; stop, resume, and retry behavior for interrupted, failed, or warning-bearing transfers. | P1, with the safety contract taking precedence over speed. |
-| Scheduling | Queuing by source or destination, and cascading copies or destination groups. | Queue policy P1; cascading P2. |
-| Connectivity | S3 destinations and browser-based remote monitoring with completion notifications. | Remote monitoring P2; object storage deferred. |
-| Professional integrations | Ingest Browser, Codex/Alexa 35 workflows, scripts/API, floating licenses, and helper tooling. | Defer until a demonstrated user need; automation is P2. |
+The current application already demonstrates one-source-to-many-destinations,
+bounded streaming hashes, uncached destination read-back, atomic staging, JSON,
+Markdown and ASC MHL v2 evidence, resource-aware multi-task scheduling, durable
+spool history, local notifications, interruption recovery, preflight checks,
+and verified-source eject. These are the foundation for the accepted 1.0 work,
+not a separate MVP product tier.
 
-## Design decisions learned from the reference
+## Release decisions
 
-- A green completion state must mean every required destination passed
-  verification, not simply that all bytes were written.
-- Source media remains read-only. doppelganger does not make a source safe to
-  format; it tells the user precisely whether the requested copies verified.
-- A transfer manifest is a deliverable, not diagnostic output. It must be
-  sufficient for an independent later verification.
-- Resume and duplicate detection are useful only if they cannot turn an
-  incomplete or unverified destination file into an apparent success.
-- Organization and cloud workflows are valuable, but cannot dilute the core
-  copy → verify → manifest → report contract.
+- Open source under `GPL-3.0-only`; no trial, license, purchase restore, account,
+  paid update channel, or telemetry.
+- Direct distribution is a non-sandboxed, Developer ID signed, hardened,
+  notarized and stapled DMG.
+- GitHub Release CI and an automatic updater are not part of 1.0. A documented
+  local release flow is required.
+- Bundled FFmpeg must be an LGPL-only dynamic build with complete notices,
+  reproducible build instructions, corresponding source, and replaceable
+  libraries.
 
 ## Reference sources
 
 Last reviewed: 2026-08-09.
 
+- [ASC MHL documentation](https://ascmhl.readthedocs.io/en/stable/)
+- [ASC MHL project](https://ascmitc.github.io/mhl/)
 - [OffShoot feature index](https://docs.hedge.video/offshoot/features)
-- [OffShoot overview](https://docs.hedge.video/offshoot/overview)
-- [Verification](https://docs.hedge.video/offshoot/features/verification)
-- [Organization](https://docs.hedge.video/offshoot/features/organization)
-- [Duplicate Detection](https://docs.hedge.video/offshoot/features/duplicate-detect)
-- [Stop & Resume](https://docs.hedge.video/offshoot/features/stop-and-resume)
-- [Standard vs. Pro feature matrix](https://docs.hedge.video/offshoot/standard-vs.-pro)

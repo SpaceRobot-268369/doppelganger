@@ -1,9 +1,8 @@
 # Conventions & Architecture
 
-> **Status: planned, not implemented.** No application source exists in this
-> repository yet. Every path, scheme, and target named below is a design
-> decision to be created — do not cite them as existing code, and verify before
-> referencing them.
+> **Status: active implementation.** The Xcode project, SwiftUI application,
+> test target, transfer engine, and evidence writers exist. The product is in
+> full 1.0 development and is not yet a signed production release.
 
 ---
 
@@ -12,21 +11,24 @@
 - **Swift 6**, strict concurrency enabled.
 - **SwiftUI** for the interface; AppKit only where SwiftUI lacks the capability
   (e.g. certain Finder-adjacent affordances).
-- **macOS only.** Minimum deployment target to be decided when the project is
-  created; pick the oldest version that supports the concurrency and
-  file-coordination APIs actually used.
+- **macOS 26+ only.** Liquid Glass is part of the intended product language.
 - **Xcode project** (`Doppelganger.xcodeproj`), built with `xcodebuild`. Not an
   SPM-generated app target — local packages may still be vendored for isolated
   logic.
+- **GRDB 7.x + SQLite** for the durable indexed catalog, migrations, and audit
+  history. Portable evidence files remain independently readable.
+- **AVFoundation plus pluggable format detectors** for media inspection. If a
+  future build bundles FFmpeg/ffprobe, it must be LGPL-only, dynamically
+  replaceable, and never required for core copying.
 
-## Planned layout
+## Layout
 
 ```
 Doppelganger.xcodeproj
 App/            SwiftUI entry point, windows, views, view models
 Core/           Offload engine, checksum, manifest writer — no UI, no AppKit
-Platform/       macOS integration: DiskArbitration volume watching,
-                security-scoped bookmarks, sandbox entitlements, disk I/O
+Platform/       macOS integration: volume watching, database setup, media tools,
+                notifications, avatar storage, and disk I/O
 Tests/          DoppelgangerTests — Core is the priority target for coverage
 ```
 
@@ -76,9 +78,12 @@ Pipe through `xcbeautify` or `xcpretty` if installed; neither is required.
 - **Progress reporting is derived, not authoritative.** A byte counter reaching
   100% is not success; only a completed verification pass is. See
   [`offload-model.md`](../product/offload-model.md).
-- **Sandbox and entitlements.** Reading arbitrary volumes and remembering
-  destinations across launches requires security-scoped bookmarks. Decide the
-  sandbox posture before writing file-picking code, not after.
+- **Distribution is intentionally non-sandboxed.** Persistent paths are treated
+  as hints and revalidated on use. File selection and drag/drop remain explicit;
+  the app does not scan arbitrary user storage in the background.
+- **Operator Profiles are not authentication.** Persist stable UUIDs, archive
+  referenced profiles instead of deleting them, and snapshot the actor name in
+  immutable attempts/audit events.
 - **Don't test against real media.** Per
   [Principle 3](../../../AGENTS.md#principles), fixtures only.
 
@@ -87,5 +92,23 @@ Pipe through `xcbeautify` or `xcpretty` if installed; neither is required.
 - Formatting/linting: not yet adopted. If added, `swift-format` or SwiftLint with
   the config committed at the repo root, and the command documented here in the
   same approved change.
-- CI: none yet. When added, pipelines live in `.github/workflows/` and this
-  section records how to reproduce them locally.
+- GitHub Release CI is deliberately absent for 1.0. Release preparation uses a
+  local, reviewed archive → Developer ID sign → hardened runtime → notarize →
+  staple → DMG checklist.
+
+## Data and evidence
+
+- The Application Support catalog uses GRDB migrations, WAL, foreign keys, and
+  transactional writes. Back up the database before a schema migration.
+- Import schema-v1 spool manifests idempotently without moving or rewriting
+  their evidence files.
+- Task organization is mutable; attempts, audit events, item results, and
+  evidence artifacts are append-only historical facts.
+- Core JSON/Markdown/ASC MHL failure prevents Verified. Optional contact-sheet
+  failure records an auxiliary warning without changing a verified media result.
+
+## Localization
+
+New user-facing text belongs in the localization resources. English is the
+development language and Simplified Chinese (`zh-Hans`) is the required 1.0
+localization; machine-readable JSON and MHL schema tokens remain invariant.

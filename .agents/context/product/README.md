@@ -7,6 +7,8 @@ What doppelganger is, who it serves, and the vocabulary its code and docs share.
 | Purpose, audience, and scope | [`product-vision.md`](product-vision.md) |
 | Domain model, vocabulary, and the verification contract | [`offload-model.md`](offload-model.md) |
 | Feature roadmap, progress, and Hedge/OffShoot reference baseline | [`features.md`](features.md) |
+| Internal delivery stages and 1.0 boundaries | [`roadmap.md`](roadmap.md) |
+| Liquid Glass visual language, status semantics, and concept image | [`design-language.md`](design-language.md) |
 
 Read [`offload-model.md`](offload-model.md) before working on anything that
 copies, hashes, verifies, or removes files. It defines guarantees that

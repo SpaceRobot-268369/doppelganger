@@ -76,10 +76,9 @@ provably complete.
 
 - **Platform** — macOS only.
 - **Stack** — Swift + SwiftUI, built as an Xcode project via `xcodebuild`.
-- **Status** — **pre-implementation.** No application source exists yet; this
-  repository currently contains only the agent file system and documentation.
-  Anything describing app structure is a *plan*, not a description of code on
-  disk.
+- **Status** — **full-product 1.0 development.** The repository contains
+  application source, a tested transfer engine, and an approved complete-product
+  roadmap. It is not yet a signed, production-distributed release.
 
 Development happens in parallel via Git worktrees by default — see
 [`worktree-workflow.md`](.agents/context/dev-spec/worktree-workflow.md).
@@ -119,8 +118,8 @@ Paths below are relative to the main checkout, `doppelganger-main/`.
 | `.agents/hooks/` | Reserved for provider-neutral hook scripts; currently empty. |
 | `.codex/`, `.cursor/` | Thin provider pointers back to this file. |
 
-Application source directories (`App/`, `Core/`, `Platform/`, `Tests/`) are
-**planned**; see [`conventions.md`](.agents/context/dev-spec/conventions.md).
+Application source lives in `App/`, `Core/`, `Platform/`, and `Tests/`; see
+[`conventions.md`](.agents/context/dev-spec/conventions.md).
 
 ## Development Specification
 
@@ -137,6 +136,9 @@ Application source directories (`App/`, `Core/`, `Platform/`, `Tests/`) are
 |-------|------|
 | What doppelganger is for and who uses it | [`.agents/context/product/product-vision.md`](.agents/context/product/product-vision.md) |
 | Domain model, vocabulary, and the verification contract | [`.agents/context/product/offload-model.md`](.agents/context/product/offload-model.md) |
+| Liquid Glass UI language and interaction invariants | [`.agents/context/product/design-language.md`](.agents/context/product/design-language.md) |
+| Stable feature IDs and decisions | [`.agents/context/product/features.md`](.agents/context/product/features.md) |
+| Internal delivery stages | [`.agents/context/product/roadmap.md`](.agents/context/product/roadmap.md) |
 
 ## Skills
 
@@ -159,7 +161,8 @@ execution style without creating a separate command type.
 | [`commit`](.agents/skills/commit/SKILL.md) | Stage and commit current changes after explicit approval, with a Conventional Commits message composed from the diff. |
 | [`grill-me`](.agents/skills/grill-me/SKILL.md) | Stress-test a plan or design through focused, dependency-aware questions. |
 
-Build- and run-oriented skills will be added once application source exists.
+Build- and run-oriented skills may be added when their workflow is stable enough
+to preserve across worktrees.
 
 ## Provider Discovery
 

@@ -29,19 +29,34 @@ That audience dictates the design posture:
   verification must be impossible to mistake for a good one.
 - **Trustworthy under interruption.** Cards get yanked, drives get unplugged,
   laptops sleep. The tool must be honest about what completed.
+- **Review before writing.** Operators see exact output folders, volume
+  independence, capacity, empty/zero-byte findings, and blocking issues before
+  an offload starts.
+- **Readable at task density.** Several simultaneous offloads must remain
+  scannable; animation and translucent decoration cannot compete with status.
 
 ## Scope
 
-**In scope:** multi-destination copy, streaming checksum verification, transfer
-manifests/logs, source and destination selection with persistence across launches,
-progress reporting, and clear per-file result reporting.
+The complete 1.0 is a local, professional offload product rather than a narrow
+demo. It combines verified multi-destination transfer with pause/resume,
+standalone verification, ASC MHL, multi-source queueing, destination and project
+libraries, camera-media health checks, optional contact sheets, durable history,
+multiple local Operator Profiles, onboarding, Help, and bilingual UI. The stable
+commitment list is [`features.md`](features.md).
 
-**Explicitly deferred:** cloud upload, transcoding, proxy generation, media
-playback and review, and any form of card formatting or source deletion. Source
-deletion in particular is a feature that must be designed with far more care than
-the rest of the app combined — see
-[Principle 3](../../../AGENTS.md#principles) — and is not part of the initial
-product.
+Projects are optional. Transfers can always live in No Project, and later
+organization changes never rewrite verification evidence. Operator Profiles are
+also local declarations, not authenticated accounts: the active profile makes
+responsibility visible and is snapshotted in task, attempt, and audit history.
+
+**Explicitly outside 1.0:** cloud upload, transcoding, proxy generation, media
+playback/review, remote monitoring, remote notifications, NLE export, automation
+interfaces, selective copy, path reorganization, and every form of card
+formatting or source deletion. See [Principle 3](../../../AGENTS.md#principles).
+
+The project is open source under GPL-3.0-only. There is no trial, commercial
+license state, account service, purchase restoration, paid update channel, or
+telemetry requirement.
 
 ## Prior art
 
