@@ -22,10 +22,13 @@ struct SidebarView: View {
         }
     }
 
+    /// While a secondary page is open the sidebar shows no selection, so any
+    /// row — including the section the page opened over — is a change the list
+    /// reports back and the page steps aside for.
     private var sectionSelection: Binding<SidebarSection?> {
         Binding(
-            get: { model.section },
-            set: { if let section = $0 { model.section = section } }
+            get: { model.showingNewOffload ? nil : model.section },
+            set: { if let section = $0 { model.selectSection(section) } }
         )
     }
 
@@ -49,6 +52,49 @@ struct SidebarView: View {
         VStack(alignment: .leading, spacing: 2) {
             Divider()
                 .padding(.bottom, 6)
+            Menu {
+                ForEach(model.productStore.profiles) { profile in
+                    Button {
+                        model.productStore.activate(profile)
+                    } label: {
+                        if profile.id == model.productStore.activeProfile.id {
+                            Label(profile.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(profile.displayName)
+                        }
+                    }
+                }
+                Divider()
+                Button("Manage Profiles…") {
+                    model.selectSection(.preferences)
+                }
+            } label: {
+                HStack(spacing: 9) {
+                    OperatorAvatarView(
+                        profile: model.productStore.activeProfile,
+                        avatarStore: model.productStore.avatars,
+                        size: 30
+                    )
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(model.productStore.activeProfile.displayName)
+                            .font(.callout.weight(.medium))
+                            .lineLimit(1)
+                        Text("Active operator")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .contentShape(RoundedRectangle(cornerRadius: 9))
+            }
+            .menuStyle(.button)
+            .buttonStyle(.glass)
+            .help("Switch the local operator recorded in new tasks and audit events")
             HStack(spacing: 7) {
                 Image(systemName: model.systemNominal ? "circle.fill" : "exclamationmark.octagon.fill")
                     .font(.caption)
@@ -65,9 +111,9 @@ struct SidebarView: View {
             SidebarFooterRow(
                 title: SidebarSection.preferences.title,
                 icon: SidebarSection.preferences.icon,
-                selected: model.section == .preferences
+                selected: model.section == .preferences && !model.showingNewOffload
             ) {
-                model.section = .preferences
+                model.selectSection(.preferences)
             }
         }
         .padding(.horizontal, 8)

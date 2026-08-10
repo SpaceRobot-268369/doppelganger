@@ -24,8 +24,15 @@ enum EngineHarness {
         destinations: [URL],
         spool: URL,
         algorithm: ChecksumAlgorithm = .xxh64,
+        verificationProfile: VerificationProfile = .standard,
+        sourceFingerprint: String? = nil,
+        resumeManifest: TransferManifest? = nil,
+        retryManifest: TransferManifest? = nil,
+        includedRelativePaths: Set<String>? = nil,
+        duplicateManifests: [String: TransferManifest] = [:],
         chunkSize: Int = 64 * 1024,
-        cancelWhen: (@Sendable (TransferEvent) -> Bool)? = nil
+        cancelWhen: (@Sendable (TransferEvent) -> Bool)? = nil,
+        pauseWhen: (@Sendable (TransferEvent) -> Bool)? = nil
     ) async throws -> Run {
         let engine = TransferEngine(
             fileSystem: fileSystem,
@@ -33,15 +40,26 @@ enum EngineHarness {
         )
         let request = TransferRequest(
             sourceRoot: source, destinationRoots: destinations,
-            algorithm: algorithm, spoolDirectory: spool, allowSameVolume: true)
+            algorithm: algorithm, verificationProfile: verificationProfile,
+            sourceFingerprint: sourceFingerprint,
+            spoolDirectory: spool, allowSameVolume: true,
+            resumeManifest: resumeManifest,
+            retryManifest: retryManifest,
+            includedRelativePaths: includedRelativePaths,
+            duplicateManifests: duplicateManifests)
         var events: [TransferEvent] = []
         var report: TransferReport?
         var cancelSent = false
+        var pauseSent = false
         for await event in await engine.run(request) {
             events.append(event)
             if !cancelSent, let cancelWhen, cancelWhen(event) {
                 cancelSent = true
                 await engine.cancel()
+            }
+            if !pauseSent, let pauseWhen, pauseWhen(event) {
+                pauseSent = true
+                await engine.pause()
             }
             if case .finished(let finished) = event { report = finished }
         }

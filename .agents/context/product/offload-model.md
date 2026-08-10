@@ -14,11 +14,13 @@ these meanings.
 | **Source** | The volume or folder footage is read from — typically a mounted camera card. Treated as read-only for the entire lifetime of a transfer. |
 | **Destination** | A folder the footage is written to. A transfer has **one or more**; multi-destination is a core feature, not an add-on. |
 | **Item** | One file being offloaded, with its relative path preserved from the source root. |
-| **Transfer** | One complete run: a set of items copied from one source to every destination, then verified. The unit the user starts, watches, and trusts. |
+| **Task** | The durable user-facing job. It owns mutable organizational metadata and aggregates one or more immutable attempts. |
+| **Attempt** | One execution of copy, resume, retry, standalone verification, cascade, or contact-sheet work. It never overwrites an earlier attempt. |
+| **Operator Profile** | A local, non-authenticated identity selected in the app. Attempts and state-changing audit events snapshot its stable ID and display name. |
 | **Copy pass** | The write phase — reading items from the source and writing them to each destination. |
 | **Verification pass** | The read-back phase — independently hashing what landed at each destination and comparing to the source hash. |
 | **Manifest** | The written record of a transfer: every item, its size, its checksum, its destinations, and its per-destination verification result. |
-| **Result** | Per item, per destination: `verified`, `failed`, or `skipped` — with a reason. There is no fourth state and no implicit success. |
+| **Result** | Per item, per destination: `verified`, `transferredPendingVerification`, `failed`, or `skipped`, always with explicit evidence. |
 
 ## The contract
 
@@ -36,8 +38,9 @@ it non-negotiable.
 
 Rules that follow from it:
 
-- **A copy is not a success.** Only a passed verification is. Progress at 100%
-  means the copy pass finished, nothing more.
+- **A copy is not a verified success.** Only a passed verification is. Progress
+  at 100% means the copy pass finished, nothing more. Fast-profile output is
+  yellow `Transferred — verification pending`, never green.
 - **Verification re-reads from disk.** Comparing an in-memory hash computed
   during the write against itself proves nothing — it would pass even if the
   write never reached the platter. Read the destination file back.
@@ -52,9 +55,11 @@ Rules that follow from it:
 - **Publishing a file is atomic.** Bytes are written and closed under a hidden,
   transfer-scoped staging name, then exclusively renamed to the final name.
   A crash or failed write never leaves a partial file masquerading as footage.
-- **Evidence is part of success.** If the required JSON/Markdown/MHL records
+- **Core evidence is part of success.** If required JSON/Markdown/ASC MHL records
   cannot be written everywhere expected, the transfer is failed even when all
   media bytes verified. No stale `verified` record or partial MHL remains.
+  Optional artifacts such as a contact sheet have their own warning state and
+  cannot retroactively invalidate verified media.
 - **The source plan is stable.** Size and modification metadata are checked
   before a staged file is published, and the complete source is enumerated
   again after copy/verification. A changing source fails the transfer.
@@ -63,11 +68,23 @@ Rules that follow from it:
 - **Each offload owns a new output folder.** Preflight rejects existing output
   roots and overlap with the source. Name collisions never overwrite a file.
 
+## Verification profiles
+
+| Profile | Required reads | Terminal meaning |
+|---|---|---|
+| **Fast** | Hash the source during copy; validate destination size and metadata only. | Yellow `Transferred — verification pending`; unsafe to eject until a later standalone verification passes. |
+| **Standard** | Hash the source during copy and fully re-read every destination uncached. | Green only after all copies match; product default. |
+| **Maximum** | Independent source pre-read, copy, then full uncached destination read-back. | Green only after all three phases complete. |
+
+A standalone verification is a new attempt. It may upgrade the task aggregate
+from pending to verified, but the earlier Fast attempt remains immutable.
+
 ## Checksums
 
 | Algorithm | Role |
 |-----------|------|
-| **xxHash64** | Default. Fast enough to keep hashing off the critical path on modern hardware. Not cryptographic — it does not need to be; the threat model is bit rot and truncated writes, not a forger. |
+| **XXH3-64** | Default and fastest supported choice. Not cryptographic; the threat model is accidental corruption rather than a malicious forger. |
+| **XXH64BE** | ASC MHL-compatible xxHash64 representation. |
 | **MD5** | Compatibility. Required for MHL manifests other tools will read, and for facilities that mandate it. Slower. |
 
 Requirements either way:
@@ -77,8 +94,23 @@ Requirements either way:
 - **Hash the source once**, during the copy pass, and reuse that digest for
   every destination comparison. Re-reading the card per destination is both slow
   and needless wear.
-- **Algorithm choice is per-transfer and recorded in the manifest.** A manifest
+- **Algorithm choice is Settings-only and snapshotted per task.** Running,
+  resumed, and retried attempts retain their original algorithm. A manifest
   whose algorithm is unknown is not verifiable later.
+
+## Tasks, attempts, and attribution
+
+- Task organization (Project, Shooting Day, Camera/Card) may change later;
+  manifests, attempts, item results, and audit events may not.
+- Resume, retry, Verify Again, cascade, and contact-sheet work create linked
+  attempts. Nothing edits a failure into success.
+- The active Operator Profile is visible before Start. An attempt records the
+  profile that initiated it; each state-changing user action records the active
+  profile at that moment.
+- Profile attribution is declarative local provenance, not authentication. A
+  rename or archive never changes the stored display-name snapshot.
+- System completion/failure events identify the system as actor and retain the
+  initiating Profile for context.
 
 ## Manifests
 

@@ -136,6 +136,23 @@ public struct RealFileSystem: FileSystemAccess {
         }
     }
 
+    public func replaceGeneratedIndexAtomically(from staging: URL, to final: URL) throws {
+        if rename(staging.path, final.path) != 0 {
+            throw IOContext.writing.map(errno, path: final.path)
+        }
+    }
+
+    public func setModificationTime(_ timeIntervalSince1970: TimeInterval, at url: URL) throws {
+        do {
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: timeIntervalSince1970)],
+                ofItemAtPath: url.path
+            )
+        } catch {
+            throw FileSystemError.other(code: -1, detail: "Could not preserve timestamp at \(url.path): \(error.localizedDescription)")
+        }
+    }
+
     public func removeItem(at url: URL) throws {
         if unlink(url.path) != 0 {
             throw IOContext.writing.map(errno, path: url.path)
@@ -154,12 +171,17 @@ public struct RealFileSystem: FileSystemAccess {
         let components = relativePath.split(separator: "/").map(String.init)
         return components.contains { component in
             component == ".DS_Store"
+                || component == "ascmhl"
                 || component == ".Spotlight-V100"
                 || component == ".fseventsd"
                 || component == ".Trashes"
                 || component == ".TemporaryItems"
                 || component.hasPrefix("._")
                 || component.hasPrefix(".doppelganger-partial-")
+                || component.hasPrefix("doppelganger-manifest-")
+                || component.hasPrefix("doppelganger-report-")
+                || component.hasPrefix("doppelganger-transfer-")
+                || component.hasPrefix("doppelganger-contact-sheet-")
         }
     }
 

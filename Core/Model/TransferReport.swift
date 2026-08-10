@@ -22,6 +22,11 @@ public struct TransferReport: Sendable {
     public let id: UUID
     public let status: TransferStatus
     public let algorithm: ChecksumAlgorithm
+    public let verificationProfile: VerificationProfile
+    public let taskID: UUID
+    public let operatorSnapshot: OperatorSnapshot?
+    public let projectID: UUID?
+    public let sourceFingerprint: String?
     public let sourceRoot: URL
     /// In request order; manifest and UI render destinations in this order.
     public let destinations: [URL]
@@ -39,6 +44,11 @@ public struct TransferReport: Sendable {
         id: UUID,
         status: TransferStatus,
         algorithm: ChecksumAlgorithm,
+        verificationProfile: VerificationProfile = .standard,
+        taskID: UUID? = nil,
+        operatorSnapshot: OperatorSnapshot? = nil,
+        projectID: UUID? = nil,
+        sourceFingerprint: String? = nil,
         sourceRoot: URL,
         destinations: [URL],
         startedAt: Date,
@@ -50,6 +60,11 @@ public struct TransferReport: Sendable {
         self.id = id
         self.status = status
         self.algorithm = algorithm
+        self.verificationProfile = verificationProfile
+        self.taskID = taskID ?? id
+        self.operatorSnapshot = operatorSnapshot
+        self.projectID = projectID
+        self.sourceFingerprint = sourceFingerprint
         self.sourceRoot = sourceRoot
         self.destinations = destinations
         self.startedAt = startedAt
@@ -73,6 +88,9 @@ public struct TransferReport: Sendable {
     }
     public var skippedCount: Int {
         count { if case .skipped = $0 { return true } else { return false } }
+    }
+    public var pendingVerificationCount: Int {
+        count { if case .transferredPendingVerification = $0 { return true } else { return false } }
     }
 
     private func count(_ matches: (ItemDestinationOutcome) -> Bool) -> Int {

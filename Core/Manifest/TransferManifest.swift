@@ -13,6 +13,7 @@ public struct TransferManifest: Codable, Sendable, Equatable {
         public var verifiedCount: Int
         public var failedCount: Int
         public var skippedCount: Int
+        public var pendingVerificationCount: Int? = nil
     }
 
     public struct ItemRecord: Codable, Sendable, Equatable {
@@ -42,6 +43,7 @@ public struct TransferManifest: Codable, Sendable, Equatable {
         public var verifiedCount: Int
         public var failedCount: Int
         public var skippedCount: Int
+        public var pendingVerificationCount: Int? = nil
     }
 
     public var schemaVersion: Int
@@ -61,20 +63,28 @@ public struct TransferManifest: Codable, Sendable, Equatable {
     /// Optional for backward compatibility with manifests written by early
     /// demo builds.
     public var issues: [String]? = nil
+    public var taskID: String? = nil
+    public var attemptID: String? = nil
+    public var verificationProfile: String? = nil
+    public var projectID: String? = nil
+    public var operatorProfileID: String? = nil
+    public var operatorDisplayName: String? = nil
+    public var sourceFingerprint: String? = nil
 }
 
 extension TransferManifest {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 2
 
     public init(report: TransferReport) {
         let iso = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
 
         var destinationRecords: [DestinationRecord] = []
         for destination in report.destinations {
-            var verified = 0, failed = 0, skipped = 0
+            var verified = 0, failed = 0, skipped = 0, pending = 0
             for item in report.items {
                 switch item.outcomes[destination] {
-                case .verified: verified += 1
+                case .verified, .verifiedDuplicate: verified += 1
+                case .transferredPendingVerification: pending += 1
                 case .failed: failed += 1
                 case .skipped: skipped += 1
                 case nil: break
@@ -84,7 +94,8 @@ extension TransferManifest {
                 path: destination.path,
                 verifiedCount: verified,
                 failedCount: failed,
-                skippedCount: skipped
+                skippedCount: skipped,
+                pendingVerificationCount: pending == 0 ? nil : pending
             ))
         }
 
@@ -117,10 +128,19 @@ extension TransferManifest {
                 totalBytes: report.totalBytes,
                 verifiedCount: report.verifiedCount,
                 failedCount: report.failedCount,
-                skippedCount: report.skippedCount
+                skippedCount: report.skippedCount,
+                pendingVerificationCount: report.pendingVerificationCount == 0
+                    ? nil : report.pendingVerificationCount
             ),
             items: itemRecords,
-            issues: report.issues.isEmpty ? nil : report.issues
+            issues: report.issues.isEmpty ? nil : report.issues,
+            taskID: report.taskID.uuidString.lowercased(),
+            attemptID: report.id.uuidString.lowercased(),
+            verificationProfile: report.verificationProfile.rawValue,
+            projectID: report.projectID?.uuidString.lowercased(),
+            operatorProfileID: report.operatorSnapshot?.profileID.uuidString.lowercased(),
+            operatorDisplayName: report.operatorSnapshot?.displayName,
+            sourceFingerprint: report.sourceFingerprint
         )
     }
 
@@ -128,6 +148,19 @@ extension TransferManifest {
         switch outcome {
         case .verified:
             ItemRecord.Result(destination: destination.path, status: "verified")
+        case .verifiedDuplicate:
+            ItemRecord.Result(
+                destination: destination.path,
+                status: "verified",
+                reason: "verified-duplicate-skip",
+                detail: "Existing destination bytes were independently hashed and matched; no copy was written."
+            )
+        case .transferredPendingVerification:
+            ItemRecord.Result(
+                destination: destination.path,
+                status: "transferred-pending-verification",
+                reason: "destination-readback-required"
+            )
         case .failed(let reason):
             ItemRecord.Result(
                 destination: destination.path,

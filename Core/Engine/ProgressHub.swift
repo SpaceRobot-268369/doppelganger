@@ -44,6 +44,11 @@ actor ProgressHub {
         emit(force: false)
     }
 
+    func addCopiedBytes(_ count: Int, at destination: URL) {
+        progress.copiedBytesByDestination[destination, default: 0] += Int64(count)
+        emit(force: false)
+    }
+
     func addVerifiedBytes(_ count: Int, at destination: URL) {
         progress.verifiedBytesByDestination[destination, default: 0] += Int64(count)
         emit(force: false)

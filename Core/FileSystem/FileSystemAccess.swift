@@ -78,6 +78,15 @@ public protocol FileSystemAccess: Sendable {
     /// existing final path.
     func moveItemExclusive(from staging: URL, to final: URL) throws
 
+    /// Atomically replace one generated mutable index after its prior bytes
+    /// have been archived. Transfer media and immutable evidence never use
+    /// this operation; it exists for `ascmhl_chain.xml` generation updates.
+    func replaceGeneratedIndexAtomically(from staging: URL, to final: URL) throws
+
+    /// Preserve source timestamps on a newly published destination file so a
+    /// copied card retains a stable source-plan identity for later cascades.
+    func setModificationTime(_ timeIntervalSince1970: TimeInterval, at url: URL) throws
+
     /// Remove a single file. The engine only ever calls this to clean up a
     /// partial destination copy — never under a source root.
     func removeItem(at url: URL) throws

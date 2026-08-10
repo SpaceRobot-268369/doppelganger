@@ -32,7 +32,7 @@ struct SubtabFilterChip: View {
                         .fill(dot)
                         .frame(width: 6, height: 6)
                 }
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.callout.weight(.medium))
                     .foregroundStyle(isSelected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
                 if let count {

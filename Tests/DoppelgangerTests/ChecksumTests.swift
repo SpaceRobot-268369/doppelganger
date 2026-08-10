@@ -72,4 +72,30 @@ struct ChecksumTests {
         Array("second".utf8).withUnsafeBytes { hasher.update($0) }
         #expect(hasher.hexDigest() != first)
     }
+
+    @Test func xxh3EmptyInputMatchesOfficialReferenceVector() {
+        let hasher = XXH3Streaming()
+        #expect(hasher.hexDigest() == "2d06800538d394c2")
+    }
+
+    @Test func xxh3LongInputMatchesOfficialReferenceVectorAcrossChunks() {
+        let prime32: UInt64 = 2_654_435_761
+        let prime64: UInt64 = 11_400_714_785_074_694_797
+        var generator = prime32
+        var bytes = [UInt8](repeating: 0, count: 2_367)
+        for index in bytes.indices {
+            bytes[index] = UInt8(truncatingIfNeeded: generator >> 56)
+            generator = generator &* prime64
+        }
+        for chunkSize in [1, 7, 64, 1_024, 4_096] {
+            let hasher = XXH3Streaming()
+            var offset = 0
+            while offset < bytes.count {
+                let end = min(offset + chunkSize, bytes.count)
+                bytes[offset..<end].withUnsafeBytes { hasher.update($0) }
+                offset = end
+            }
+            #expect(hasher.hexDigest() == "cb37aeb9e5d361ed", "chunk size \(chunkSize)")
+        }
+    }
 }

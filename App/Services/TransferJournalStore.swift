@@ -7,6 +7,8 @@ struct TransferJournal: Codable, Sendable, Identifiable {
         case queued
         case running
         case finalizing
+        case paused
+        case transferredPendingVerification
         case verified
         case failed
         case cancelled
@@ -16,11 +18,19 @@ struct TransferJournal: Codable, Sendable, Identifiable {
     }
 
     let id: UUID
+    var taskID: UUID? = nil
+    var parentAttemptID: UUID? = nil
+    var attemptKind: TransferAttemptKind? = nil
     let label: String
     let source: URL
     let destinationBases: [URL]
     let destinations: [URL]
     let algorithm: ChecksumAlgorithm
+    var verificationProfile: VerificationProfile? = nil
+    var operatorProfileID: UUID? = nil
+    var operatorDisplayName: String? = nil
+    var projectID: UUID? = nil
+    var sourceFingerprint: String? = nil
     let allowSameVolume: Bool
     let createdAt: Date
     var startedAt: Date?

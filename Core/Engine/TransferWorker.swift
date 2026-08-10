@@ -19,10 +19,14 @@ struct TransferWorker {
     let configuration: TransferConfiguration
     let fileSystem: any FileSystemAccess
     let hub: ProgressHub
+    let control: TransferControl
 
     private var items: [SourceItem] = []
     /// relativePath → source digest, computed once during the copy pass.
     private var digests: [String: String] = [:]
+    /// Maximum-profile independent source pre-read digests.
+    private var preReadDigests: [String: String] = [:]
+    private var trustedSourceDigests: [String: String] = [:]
     private var outcomes: [String: [URL: ItemDestinationOutcome]] = [:]
     /// Copied-but-not-yet-verified pairs, per destination. Copied is not
     /// success; everything here must still pass the verify pass.
@@ -31,6 +35,7 @@ struct TransferWorker {
     private var deadDestinations: Set<URL> = []
     private var sourceDead = false
     private var cancelled = false
+    private var paused = false
     /// The request itself was invalid (e.g. a destination inside the source);
     /// zero items must not read as a vacuous success.
     private var vetoed = false
@@ -41,12 +46,14 @@ struct TransferWorker {
         request: TransferRequest,
         configuration: TransferConfiguration,
         fileSystem: any FileSystemAccess,
-        hub: ProgressHub
+        hub: ProgressHub,
+        control: TransferControl = TransferControl()
     ) {
         self.request = request
         self.configuration = configuration
         self.fileSystem = fileSystem
         self.hub = hub
+        self.control = control
     }
 
     mutating func run() async {
@@ -71,6 +78,24 @@ struct TransferWorker {
             await finish(writeToDestinations: true)
             return
         }
+        if let includedRelativePaths = request.includedRelativePaths {
+            let completePlan = items
+            items = completePlan.filter { includedRelativePaths.contains($0.relativePath) }
+            let discovered = Set(items.map(\.relativePath))
+            let missing = includedRelativePaths.subtracting(discovered).sorted()
+            if !missing.isEmpty {
+                vetoed = true
+                // The requested set is the contract: whether it came from a
+                // fine-grained retry or an operator's own selection, a missing
+                // item means the reviewed plan cannot be carried out.
+                transferIssues.append(
+                    "Requested source items are missing: " + missing.prefix(8).joined(separator: ", ")
+                )
+                await hub.log(.error, transferIssues.last ?? "Requested source items are missing")
+                await finish(writeToDestinations: false)
+                return
+            }
+        }
         let totalBytes = items.reduce(0) { $0 + $1.size }
         await hub.plan(totalBytes: totalBytes, itemsTotal: items.count)
         await hub.log(.info, "Plan: \(items.count) files, \(MarkdownReportWriter.byteString(totalBytes))")
@@ -79,6 +104,36 @@ struct TransferWorker {
             vetoed = true
             transferIssues.append("The source is empty; no media was copied.")
             await hub.log(.error, "Source is empty; refusing to report a verified transfer")
+            await finish(writeToDestinations: false)
+            return
+        }
+        let planFingerprint = SourcePlanFingerprint.make(items)
+        if let expectedFingerprint = request.sourceFingerprint,
+           expectedFingerprint != planFingerprint {
+            vetoed = true
+            transferIssues.append("The source plan changed after review; run preflight again.")
+            await hub.log(.error, transferIssues.last ?? "Source plan changed")
+            await finish(writeToDestinations: false)
+            return
+        }
+        let sourceMHL = SourceMHLTrust.inspect(
+            sourceRoot: request.sourceRoot,
+            items: items,
+            algorithm: request.algorithm,
+            expectedFingerprint: request.sourceFingerprint,
+            fileSystem: fileSystem
+        )
+        switch sourceMHL.state {
+        case .absent: break
+        case .validButUntrusted(let reason):
+            await hub.log(.warning, "Source ASC MHL found but digests will not be reused: \(reason)")
+        case .trusted:
+            trustedSourceDigests = sourceMHL.digests
+            await hub.log(.info, "Trusted source ASC MHL chain; reusing \(trustedSourceDigests.count) source digests")
+        }
+        restoreVerifiedOutcomesFromPausedAttempt()
+        guard validateRetryScope() else {
+            vetoed = true
             await finish(writeToDestinations: false)
             return
         }
@@ -101,7 +156,15 @@ struct TransferWorker {
         }
 
         await preflightDestinations(totalBytes: totalBytes)
-        await copyPass()
+        await verifyDuplicateCandidates()
+        if request.verificationProfile == .maximum {
+            await preReadSource()
+        }
+        if paused {
+            await fillUnattemptedSkips()
+        } else {
+            await copyPass()
+        }
         await verifyPass()
         await confirmSourcePlanUnchanged()
         await finish(writeToDestinations: true)
@@ -165,7 +228,13 @@ struct TransferWorker {
                                            log: "Destination \(requested.baseRoot.path) is not mounted")
                 continue
             }
-            if request.requireNewOutputRoots, fileSystem.fileExists(at: destination) {
+            let duplicateCandidate = request.duplicateManifests[destination.path] != nil
+            if fileSystem.fileExists(at: destination),
+               (request.requireNewOutputRoots
+                    || (!request.duplicateManifests.isEmpty
+                        && !duplicateCandidate
+                        && request.resumeManifest == nil
+                        && request.retryManifest == nil)) {
                 await failWholeDestination(destination, reason: .nameCollision,
                                            log: "Output folder already exists: \(destination.path)")
                 continue
@@ -187,7 +256,8 @@ struct TransferWorker {
                 continue
             }
             let reserve = max(Int64(512 * 1024 * 1024), totalBytes / 20)
-            if let free = try? fileSystem.freeSpace(at: requested.baseRoot), free < totalBytes + reserve {
+            if !duplicateCandidate,
+               let free = try? fileSystem.freeSpace(at: requested.baseRoot), free < totalBytes + reserve {
                 await failWholeDestination(destination, reason: .destinationFull,
                                            log: "Destination \(requested.baseRoot.path) has " +
                                            "\(MarkdownReportWriter.byteString(free)) free, needs " +
@@ -236,6 +306,42 @@ struct TransferWorker {
 
     // MARK: - Copy pass
 
+    private mutating func preReadSource() async {
+        await hub.phase(.preReadingSource)
+        var buffer = [UInt8](repeating: 0, count: configuration.chunkSize)
+        for item in items {
+            guard !Task.isCancelled else {
+                cancelled = true
+                return
+            }
+            do {
+                let reader = try fileSystem.openForReading(
+                    request.sourceRoot.appendingPathComponent(item.relativePath),
+                    uncached: true
+                )
+                defer { reader.close() }
+                var hasher = request.algorithm.makeHasher()
+                while true {
+                    let count = try reader.read(into: &buffer)
+                    if count == 0 { break }
+                    buffer.withUnsafeBytes { raw in
+                        hasher.update(UnsafeRawBufferPointer(rebasing: raw[0..<count]))
+                    }
+                }
+                preReadDigests[item.relativePath] = hasher.hexDigest()
+                if await control.shouldPause() {
+                    paused = true
+                    return
+                }
+            } catch {
+                sourceDead = true
+                transferIssues.append("Maximum source pre-read failed at \(item.relativePath): \(describe(error))")
+                await hub.log(.error, transferIssues.last ?? "Source pre-read failed")
+                return
+            }
+        }
+    }
+
     private mutating func copyPass() async {
         await hub.phase(.copying)
         for item in items {
@@ -245,20 +351,34 @@ struct TransferWorker {
             await hub.beginItem(item.relativePath)
             await copy(item)
             await hub.finishItem()
+            if await control.shouldPause() {
+                paused = true
+                await hub.log(.warning, "Pause requested; stopped at a complete-file boundary")
+                break
+            }
         }
         if Task.isCancelled { cancelled = true }
         await fillUnattemptedSkips()
+    }
+
+    private final class WriterStreamBox: @unchecked Sendable {
+        let stream: any FileWriteStream
+        init(_ stream: any FileWriteStream) { self.stream = stream }
     }
 
     private struct DestinationWriter {
         let destination: URL
         let target: URL
         let staging: URL
-        let stream: any FileWriteStream
+        let channel: BoundedAsyncChannel<[UInt8]>
+        let task: Task<FileSystemError?, Never>
     }
 
     private mutating func copy(_ item: SourceItem) async {
-        let liveDestinations = request.destinationRoots.filter { !deadDestinations.contains($0) }
+        let liveDestinations = request.destinationRoots.filter {
+            !deadDestinations.contains($0)
+                && outcomes[item.relativePath]?[$0]?.isVerified != true
+        }
         guard !liveDestinations.isEmpty else { return }
 
         var writers: [DestinationWriter] = []
@@ -269,10 +389,37 @@ struct TransferWorker {
             )
             do {
                 try fileSystem.createDirectory(at: target.deletingLastPathComponent())
-                guard !fileSystem.fileExists(at: target) else { throw FileSystemError.alreadyExists }
-                let stream = try fileSystem.openForWritingExclusive(staging)
+                if fileSystem.fileExists(at: target) {
+                    guard try quarantineRetryTargetIfAuthorized(
+                        target,
+                        relativePath: item.relativePath,
+                        destination: destination
+                    ) else { throw FileSystemError.alreadyExists }
+                }
+                let stream = WriterStreamBox(try fileSystem.openForWritingExclusive(staging))
+                let channel = BoundedAsyncChannel<[UInt8]>(capacity: 2)
+                let progressHub = hub
+                let writerTask = Task.detached(priority: .userInitiated) { () -> FileSystemError? in
+                    do {
+                        while let chunk = await channel.next() {
+                            try stream.stream.write(chunk, count: chunk.count)
+                            await progressHub.addCopiedBytes(chunk.count, at: destination)
+                        }
+                        try stream.stream.close()
+                        return nil
+                    } catch {
+                        try? stream.stream.close()
+                        await channel.close()
+                        return Self.pipelineError(error)
+                    }
+                }
                 writers.append(DestinationWriter(
-                    destination: destination, target: target, staging: staging, stream: stream))
+                    destination: destination,
+                    target: target,
+                    staging: staging,
+                    channel: channel,
+                    task: writerTask
+                ))
             } catch FileSystemError.alreadyExists {
                 // Collision fails this item here but does not kill the
                 // destination — and never overwrites the existing file.
@@ -289,7 +436,8 @@ struct TransferWorker {
             reader = try fileSystem.openForReading(request.sourceRoot.appendingPathComponent(item.relativePath), uncached: false)
         } catch {
             for writer in writers {
-                try? writer.stream.close()
+                await writer.channel.close()
+                _ = await writer.task.value
                 try? fileSystem.removeItem(at: writer.staging)
             }
             await sourceReadFailed(item, error: error)
@@ -299,69 +447,118 @@ struct TransferWorker {
 
         var hasher = request.algorithm.makeHasher()
         var buffer = [UInt8](repeating: 0, count: configuration.chunkSize)
-        var failedHere = Set<URL>()
+        var activeChannels = Dictionary(uniqueKeysWithValues: writers.map { ($0.destination, $0.channel) })
         var bytesRead: Int64 = 0
+        var readError: Error?
+        var cancelledMidCopy = false
 
         while true {
             if Task.isCancelled {
                 cancelled = true
-                for writer in writers where !failedHere.contains(writer.destination) {
-                    try? writer.stream.close()
-                    try? fileSystem.removeItem(at: writer.staging)
-                    await record(item.relativePath, writer.destination, .failed(.cancelled))
-                }
-                await hub.log(.warning, "\(item.relativePath): cancelled mid-copy; partial copies removed")
-                return
+                cancelledMidCopy = true
+                break
             }
 
             let count: Int
             do {
                 count = try reader.read(into: &buffer)
             } catch {
-                for writer in writers where !failedHere.contains(writer.destination) {
-                    try? writer.stream.close()
-                    try? fileSystem.removeItem(at: writer.staging)
-                }
-                await sourceReadFailed(item, error: error)
-                return
+                readError = error
+                break
             }
             if count == 0 { break }
             bytesRead += Int64(count)
 
-            buffer.withUnsafeBytes { raw in
-                hasher.update(UnsafeRawBufferPointer(rebasing: raw[0..<count]))
-            }
-
-            for writer in writers where !failedHere.contains(writer.destination) {
-                do {
-                    try writer.stream.write(buffer, count: count)
-                } catch {
-                    failedHere.insert(writer.destination)
-                    try? writer.stream.close()
-                    try? fileSystem.removeItem(at: writer.staging)
-                    await destinationFailed(writer.destination, item: item, error: error)
+            if trustedSourceDigests[item.relativePath] == nil || request.verificationProfile == .maximum {
+                buffer.withUnsafeBytes { raw in
+                    hasher.update(UnsafeRawBufferPointer(rebasing: raw[0..<count]))
                 }
             }
-            if failedHere.count == writers.count { return }
-            await hub.addCopiedBytes(count)
+
+            let chunk = Array(buffer[0..<count])
+            let channels = activeChannels
+            let accepted = await withTaskGroup(of: (URL, Bool).self) { group in
+                for (destination, channel) in channels {
+                    group.addTask { (destination, await channel.send(chunk)) }
+                }
+                var results: [(URL, Bool)] = []
+                for await result in group { results.append(result) }
+                return results
+            }
+            for (destination, didAccept) in accepted where !didAccept {
+                activeChannels.removeValue(forKey: destination)
+            }
+            if accepted.contains(where: { $0.1 }) {
+                await hub.addCopiedBytes(count)
+            }
+            if activeChannels.isEmpty { break }
         }
 
+        if cancelledMidCopy || readError != nil {
+            for writer in writers { await writer.channel.close() }
+        } else {
+            for writer in writers { await writer.channel.finish() }
+        }
+
+        var successfulWriters: [DestinationWriter] = []
+        for writer in writers {
+            if let error = await writer.task.value {
+                try? fileSystem.removeItem(at: writer.staging)
+                await destinationFailed(writer.destination, item: item, error: error)
+            } else {
+                successfulWriters.append(writer)
+            }
+        }
+
+        if cancelledMidCopy {
+            for writer in successfulWriters {
+                try? fileSystem.removeItem(at: writer.staging)
+                await record(item.relativePath, writer.destination, .failed(.cancelled))
+            }
+            await hub.log(.warning, "\(item.relativePath): cancelled mid-copy; partial copies removed")
+            return
+        }
+        if let readError {
+            for writer in successfulWriters { try? fileSystem.removeItem(at: writer.staging) }
+            await sourceReadFailed(item, error: readError)
+            return
+        }
+        guard !successfulWriters.isEmpty else { return }
+
         guard bytesRead == item.size, sourceStillMatches(item) else {
-            for writer in writers where !failedHere.contains(writer.destination) {
-                try? writer.stream.close()
+            for writer in successfulWriters {
                 try? fileSystem.removeItem(at: writer.staging)
             }
             await sourceChanged(item)
             return
         }
 
-        let digest = hasher.hexDigest()
+        let digest = request.verificationProfile == .maximum
+            ? hasher.hexDigest()
+            : trustedSourceDigests[item.relativePath] ?? hasher.hexDigest()
+        if let previousDigest = digests[item.relativePath], previousDigest != digest {
+            for writer in successfulWriters {
+                try? fileSystem.removeItem(at: writer.staging)
+            }
+            await sourceChanged(item)
+            return
+        }
+        if request.verificationProfile == .maximum,
+           preReadDigests[item.relativePath] != digest {
+            for writer in successfulWriters {
+                try? fileSystem.removeItem(at: writer.staging)
+            }
+            await sourceChanged(item)
+            return
+        }
         digests[item.relativePath] = digest
 
-        for writer in writers where !failedHere.contains(writer.destination) {
+        for writer in successfulWriters {
             do {
-                try writer.stream.close()
                 try fileSystem.moveItemExclusive(from: writer.staging, to: writer.target)
+                if let modificationTime = item.modificationTime {
+                    try fileSystem.setModificationTime(modificationTime, at: writer.target)
+                }
                 pendingVerify[writer.destination, default: []].append((item, digest))
                 pendingPaths[writer.destination, default: []].insert(item.relativePath)
             } catch FileSystemError.alreadyExists {
@@ -373,6 +570,11 @@ struct TransferWorker {
                 await destinationFailed(writer.destination, item: item, error: error)
             }
         }
+    }
+
+    private static func pipelineError(_ error: Error) -> FileSystemError {
+        if let error = error as? FileSystemError { return error }
+        return .other(code: -1, detail: error.localizedDescription)
     }
 
     private func sourceStillMatches(_ item: SourceItem) -> Bool {
@@ -432,6 +634,8 @@ struct TransferWorker {
                     .destinationUnavailable
                 } else if sourceDead {
                     .sourceUnavailable
+                } else if paused {
+                    .paused
                 } else {
                     .cancelled
                 }
@@ -463,6 +667,24 @@ struct TransferWorker {
         let hub = hub
         let work = pendingVerify
 
+        if request.verificationProfile == .fast {
+            for (destination, pairs) in work {
+                for pair in pairs {
+                    let target = destination.appendingPathComponent(pair.item.relativePath)
+                    let outcome: ItemDestinationOutcome
+                    if let observed = try? fileSystem.sourceItem(at: target, relativeTo: destination),
+                       observed.size == pair.item.size {
+                        outcome = .transferredPendingVerification
+                    } else {
+                        outcome = .failed(.writeFailed(detail: "Destination metadata did not match the copied source item"))
+                    }
+                    await record(pair.item.relativePath, destination, outcome)
+                }
+            }
+            pendingVerify = [:]
+            return
+        }
+
         let results = await withTaskGroup(of: (URL, [(String, ItemDestinationOutcome)]).self) { group in
             for (destination, pairs) in work {
                 let sendablePairs = pairs.map { (path: $0.item.relativePath, digest: $0.digest) }
@@ -492,9 +714,201 @@ struct TransferWorker {
         if Task.isCancelled { cancelled = true }
     }
 
+    /// Restores only pairs that the prior paused attempt independently
+    /// verified and whose source-plan metadata and destination size still
+    /// match. Everything else is copied and verified normally.
+    private mutating func restoreVerifiedOutcomesFromPausedAttempt() {
+        guard let manifest = request.resumeManifest,
+              manifest.algorithm == request.algorithm.rawValue
+                || (manifest.algorithm == "xxh64" && request.algorithm == .xxh64)
+        else { return }
+        let iso = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        let records = Dictionary(uniqueKeysWithValues: manifest.items.map { ($0.relativePath, $0) })
+        for item in items {
+            guard let record = records[item.relativePath],
+                  record.size == item.size,
+                  let digest = record.digest
+            else { continue }
+            if let priorModified = record.modifiedAt,
+               let currentModified = item.modificationTime.map({
+                   Date(timeIntervalSince1970: $0).formatted(iso)
+               }), priorModified != currentModified {
+                continue
+            }
+            digests[item.relativePath] = digest
+            for destination in request.destinationRoots {
+                guard record.results.contains(where: {
+                    $0.destination == destination.path && $0.status == "verified"
+                }) else { continue }
+                let target = destination.appendingPathComponent(item.relativePath)
+                guard let observed = try? fileSystem.sourceItem(at: target, relativeTo: destination),
+                      observed.size == item.size else { continue }
+                outcomes[item.relativePath, default: [:]][destination] = .verified
+            }
+        }
+    }
+
+    /// Existing output is only a metadata candidate. Every proposed skip
+    /// independently hashes the current source and destination, compares both
+    /// to the immutable prior digest, and records a distinct verified-skip
+    /// outcome. A mismatch falls through to collision handling; it is never
+    /// overwritten.
+    private mutating func verifyDuplicateCandidates() async {
+        guard !request.duplicateManifests.isEmpty else { return }
+        let progressHub = hub
+        await hub.log(.info, "Checking prior verified outputs for digest-proven duplicate skips")
+        for item in items {
+            let candidates: [(URL, TransferManifest.ItemRecord)] = request.destinationRoots.compactMap { destination in
+                guard !deadDestinations.contains(destination),
+                      let manifest = request.duplicateManifests[destination.path],
+                      manifest.sourceFingerprint == SourcePlanFingerprint.make(items),
+                      let record = manifest.items.first(where: { $0.relativePath == item.relativePath }),
+                      record.size == item.size,
+                      record.results.contains(where: {
+                          $0.destination == destination.path && $0.status == "verified"
+                      }),
+                      record.digest != nil
+                else { return nil }
+                return (destination, record)
+            }
+            guard !candidates.isEmpty else { continue }
+            let sourceDigest: String
+            do {
+                sourceDigest = try await hashFile(
+                    request.sourceRoot.appendingPathComponent(item.relativePath),
+                    uncached: true
+                )
+            } catch {
+                await hub.log(.warning, "Could not prove duplicate source \(item.relativePath): \(describe(error))")
+                continue
+            }
+            guard sourceStillMatches(item) else {
+                await sourceChanged(item)
+                return
+            }
+            digests[item.relativePath] = sourceDigest
+            for (destination, priorRecord) in candidates {
+                guard priorRecord.digest == sourceDigest else {
+                    await hub.log(.warning, "Prior digest no longer matches source: \(item.relativePath)")
+                    continue
+                }
+                let target = destination.appendingPathComponent(item.relativePath)
+                guard let observed = try? fileSystem.sourceItem(at: target, relativeTo: destination),
+                      observed.size == item.size
+                else { continue }
+                do {
+                    let destinationDigest = try await hashFile(target, uncached: true) { count in
+                        await progressHub.addVerifiedBytes(count, at: destination)
+                    }
+                    guard destinationDigest == sourceDigest else {
+                        await hub.log(.warning, "Existing destination digest mismatch: \(item.relativePath) at \(destination.path)")
+                        continue
+                    }
+                    await record(item.relativePath, destination, .verifiedDuplicate)
+                    await hub.log(.info, "Verified duplicate skipped: \(item.relativePath) at \(destination.path)")
+                } catch {
+                    await hub.log(.warning, "Could not prove destination duplicate \(item.relativePath): \(describe(error))")
+                }
+            }
+        }
+    }
+
+    private func hashFile(
+        _ url: URL,
+        uncached: Bool,
+        progress: ((Int) async -> Void)? = nil
+    ) async throws -> String {
+        let stream = try fileSystem.openForReading(url, uncached: uncached)
+        defer { stream.close() }
+        var hasher = request.algorithm.makeHasher()
+        var buffer = [UInt8](repeating: 0, count: configuration.chunkSize)
+        while true {
+            let count = try stream.read(into: &buffer)
+            if count == 0 { break }
+            buffer.withUnsafeBytes { raw in
+                hasher.update(UnsafeRawBufferPointer(rebasing: raw[0..<count]))
+            }
+            await progress?(count)
+        }
+        return hasher.hexDigest()
+    }
+
+    /// A retry is deliberately narrower than a resume: it may address only
+    /// pairs that the parent attempt did not verify, and the source metadata
+    /// must still match that immutable parent record.
+    private mutating func validateRetryScope() -> Bool {
+        guard let manifest = request.retryManifest else { return true }
+        guard request.resumeManifest == nil,
+              request.destinationRoots.count == 1,
+              let included = request.includedRelativePaths,
+              !included.isEmpty,
+              manifest.algorithm == request.algorithm.rawValue
+                || (manifest.algorithm == "xxh64" && request.algorithm == .xxh64)
+        else {
+            transferIssues.append("The fine-grained retry request is invalid or uses a different checksum.")
+            return false
+        }
+        let destination = request.destinationRoots[0]
+        let records = Dictionary(uniqueKeysWithValues: manifest.items.map { ($0.relativePath, $0) })
+        let iso = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        for item in items {
+            guard included.contains(item.relativePath),
+                  let record = records[item.relativePath],
+                  record.size == item.size,
+                  record.results.contains(where: {
+                      $0.destination == destination.path && $0.status != "verified"
+                  })
+            else {
+                transferIssues.append("The parent attempt does not authorize retrying \(item.relativePath).")
+                return false
+            }
+            if let priorModified = record.modifiedAt,
+               let currentModified = item.modificationTime.map({
+                   Date(timeIntervalSince1970: $0).formatted(iso)
+               }), priorModified != currentModified {
+                transferIssues.append("The source changed since the failed attempt: \(item.relativePath).")
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Preserve the parent's failed bytes under a hidden quarantine tree.
+    /// Nothing is overwritten; evidence remains alongside both generations.
+    private func quarantineRetryTargetIfAuthorized(
+        _ target: URL,
+        relativePath: String,
+        destination: URL
+    ) throws -> Bool {
+        guard let manifest = request.retryManifest,
+              let record = manifest.items.first(where: { $0.relativePath == relativePath }),
+              record.results.contains(where: {
+                  $0.destination == destination.path && $0.status != "verified"
+              })
+        else { return false }
+        let parentID = (manifest.attemptID ?? manifest.transferID).prefix(8).lowercased()
+        let quarantineRoot = destination
+            .appendingPathComponent(".doppelganger-failed", isDirectory: true)
+            .appendingPathComponent(parentID, isDirectory: true)
+        let quarantine = quarantineRoot.appendingPathComponent(relativePath)
+        try fileSystem.createDirectory(at: quarantine.deletingLastPathComponent())
+        guard !fileSystem.fileExists(at: quarantine) else { return false }
+        try fileSystem.moveItemExclusive(from: target, to: quarantine)
+        return true
+    }
+
     private mutating func confirmSourcePlanUnchanged() async {
         guard !sourceDead, !cancelled else { return }
-        guard let current = try? fileSystem.enumerate(root: request.sourceRoot), current == items else {
+        guard var current = try? fileSystem.enumerate(root: request.sourceRoot) else {
+            vetoed = true
+            transferIssues.append("The source could not be scanned after the transfer.")
+            await hub.log(.error, "Source could not be re-scanned; transfer cannot be trusted")
+            return
+        }
+        if let included = request.includedRelativePaths {
+            current = current.filter { included.contains($0.relativePath) }
+        }
+        guard current == items else {
             vetoed = true
             transferIssues.append("The source file list changed before the transfer finished.")
             await hub.log(.error, "Source file list changed after planning; transfer cannot be trusted")
@@ -576,8 +990,24 @@ struct TransferWorker {
                 outcomes[item.relativePath]?[destination]?.isVerified == true
             }
         }
+        let allTransferredPendingVerification = items.allSatisfy { item in
+            request.destinationRoots.allSatisfy { destination in
+                outcomes[item.relativePath]?[destination]?.isTransferredPendingVerification == true
+            }
+        }
+        let hasFailedOutcome = outcomes.values.contains { destinationOutcomes in
+            destinationOutcomes.values.contains { outcome in
+                if case .failed = outcome { return true }
+                return false
+            }
+        }
         var status: TransferStatus = if cancelled {
             .cancelled
+        } else if paused, !vetoed, !sourceDead, !hasFailedOutcome {
+            .paused
+        } else if request.verificationProfile == .fast,
+                  !vetoed, !sourceDead, allTransferredPendingVerification {
+            .transferredPendingVerification
         } else if vetoed || sourceDead || !allVerified {
             .failed
         } else {
@@ -587,13 +1017,41 @@ struct TransferWorker {
         let spoolTarget = request.spoolDirectory.appendingPathComponent(request.shortID, isDirectory: true)
         let roots = (writeToDestinations ? request.destinationRoots : []) + [spoolTarget]
         var locations = await writeAllRecords(status: status, roots: roots, spoolTarget: spoolTarget)
+        var evidenceFailure = locations.count != roots.count
 
-        if locations.count != roots.count {
+        if !evidenceFailure, status == .verified {
+            let provisional = makeReport(status: status, manifestLocations: locations)
+            var receipts: [MHLWriteReceipt] = []
+            do {
+                for destination in request.destinationRoots {
+                    if let receipt = try MHLHistoryStore.append(
+                        report: provisional,
+                        destination: destination,
+                        fileSystem: fileSystem
+                    ) {
+                        receipts.append(receipt)
+                    }
+                }
+            } catch {
+                for receipt in receipts.reversed() {
+                    MHLHistoryStore.rollback(receipt, fileSystem: fileSystem)
+                }
+                transferIssues.append("Could not write a complete ASC MHL generation: \(describe(error))")
+                await hub.log(.error, transferIssues.last ?? "ASC MHL write failed")
+                evidenceFailure = true
+            }
+        }
+
+        if evidenceFailure {
             let failed = roots.filter { !locations.contains($0) }.map(\.path)
-            let issue = "Could not write complete transfer evidence to: " + failed.joined(separator: ", ")
-            transferIssues.append(issue)
-            await hub.log(.error, issue)
-            if status == .verified { status = .failed }
+            if !failed.isEmpty {
+                let issue = "Could not write complete transfer evidence to: " + failed.joined(separator: ", ")
+                transferIssues.append(issue)
+                await hub.log(.error, issue)
+            }
+            if status == .verified || status == .transferredPendingVerification || status == .paused {
+                status = .failed
+            }
 
             // Records are generated by this transfer and carry its unique ID;
             // remove the first-pass set so no stale VERIFIED record survives a
@@ -605,6 +1063,10 @@ struct TransferWorker {
         let report = makeReport(status: status, manifestLocations: locations)
         await hub.phase(.done)
         switch status {
+        case .paused:
+            await hub.log(.warning, "Transfer paused safely; completed files were verified and recorded")
+        case .transferredPendingVerification:
+            await hub.log(.warning, "Transfer complete; independent destination verification is still required")
         case .verified:
             await hub.log(.info, "Transfer verified: \(report.verifiedCount) of \(report.verifiedCount) copies passed")
         case .failed:
@@ -630,11 +1092,9 @@ struct TransferWorker {
         var locations: [URL] = []
         for root in roots {
             let isSpool = root == spoolTarget
-            let mhl = isSpool ? nil : MHLWriter.xml(for: provisional, destination: root)
             if await writeRecords(
                 json: json,
                 markdown: markdown,
-                mhl: mhl,
                 to: root,
                 createFirst: isSpool
             ) {
@@ -644,7 +1104,7 @@ struct TransferWorker {
         return locations
     }
 
-    private func writeRecords(json: Data, markdown: String, mhl: String?, to root: URL, createFirst: Bool) async -> Bool {
+    private func writeRecords(json: Data, markdown: String, to root: URL, createFirst: Bool) async -> Bool {
         var written: [URL] = []
         do {
             if createFirst { try fileSystem.createDirectory(at: root) }
@@ -656,11 +1116,6 @@ struct TransferWorker {
                 ManifestWriter.reportFileName(shortID: request.shortID))
             try writeFile(Array(markdown.utf8), to: reportURL)
             written.append(reportURL)
-            if let mhl {
-                let mhlURL = root.appendingPathComponent(MHLWriter.fileName(shortID: request.shortID))
-                try writeFile(Array(mhl.utf8), to: mhlURL)
-                written.append(mhlURL)
-            }
             return true
         } catch {
             for url in written { try? fileSystem.removeItem(at: url) }
@@ -702,6 +1157,11 @@ struct TransferWorker {
             id: request.id,
             status: status,
             algorithm: request.algorithm,
+            verificationProfile: request.verificationProfile,
+            taskID: request.taskID,
+            operatorSnapshot: request.operatorSnapshot,
+            projectID: request.projectID,
+            sourceFingerprint: request.sourceFingerprint,
             sourceRoot: request.sourceRoot,
             destinations: request.destinationRoots,
             startedAt: startedAt,

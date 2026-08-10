@@ -24,6 +24,11 @@ public struct TransferRequest: Sendable {
     /// transfer to succeed.
     public let destinations: [TransferDestination]
     public let algorithm: ChecksumAlgorithm
+    public let verificationProfile: VerificationProfile
+    public let taskID: UUID
+    public let operatorSnapshot: OperatorSnapshot?
+    public let projectID: UUID?
+    public let sourceFingerprint: String?
     /// App-side directory that always receives a copy of the manifest, report,
     /// and log — even when every destination is unreachable.
     public let spoolDirectory: URL
@@ -33,6 +38,19 @@ public struct TransferRequest: Sendable {
     /// New offloads require a fresh task folder. Engine tests and explicit
     /// legacy/folder workflows may opt out while retaining collision safety.
     public let requireNewOutputRoots: Bool
+    /// A prior paused attempt whose verified pairs may be reused after the
+    /// source plan and destination metadata are revalidated.
+    public let resumeManifest: TransferManifest?
+    /// A prior failed attempt that authorizes replacing only explicitly
+    /// selected, non-verified destination pairs. Existing failed bytes are
+    /// quarantined rather than overwritten.
+    public let retryManifest: TransferManifest?
+    /// Optional whole-file subset used by a fine-grained retry. A retry
+    /// session addresses one destination, so this set is its exact scope.
+    public let includedRelativePaths: Set<String>?
+    /// Existing-output candidates keyed by canonical output path. They permit
+    /// a no-write skip only after the engine independently hashes both sides.
+    public let duplicateManifests: [String: TransferManifest]
 
     public var destinationRoots: [URL] { destinations.map(\.outputRoot) }
 
@@ -40,36 +58,72 @@ public struct TransferRequest: Sendable {
         id: UUID = UUID(),
         sourceRoot: URL,
         destinationRoots: [URL],
-        algorithm: ChecksumAlgorithm = .xxh64,
+        algorithm: ChecksumAlgorithm = .xxh3,
+        verificationProfile: VerificationProfile = .standard,
+        taskID: UUID? = nil,
+        operatorSnapshot: OperatorSnapshot? = nil,
+        projectID: UUID? = nil,
+        sourceFingerprint: String? = nil,
         spoolDirectory: URL,
         allowSameVolume: Bool = false,
-        requireNewOutputRoots: Bool = false
+        requireNewOutputRoots: Bool = false,
+        resumeManifest: TransferManifest? = nil,
+        retryManifest: TransferManifest? = nil,
+        includedRelativePaths: Set<String>? = nil,
+        duplicateManifests: [String: TransferManifest] = [:]
     ) {
         self.id = id
         self.sourceRoot = sourceRoot
         self.destinations = destinationRoots.map { TransferDestination(baseRoot: $0, outputRoot: $0) }
         self.algorithm = algorithm
+        self.verificationProfile = verificationProfile
+        self.taskID = taskID ?? id
+        self.operatorSnapshot = operatorSnapshot
+        self.projectID = projectID
+        self.sourceFingerprint = sourceFingerprint
         self.spoolDirectory = spoolDirectory
         self.allowSameVolume = allowSameVolume
         self.requireNewOutputRoots = requireNewOutputRoots
+        self.resumeManifest = resumeManifest
+        self.retryManifest = retryManifest
+        self.includedRelativePaths = includedRelativePaths
+        self.duplicateManifests = duplicateManifests
     }
 
     public init(
         id: UUID = UUID(),
         sourceRoot: URL,
         destinations: [TransferDestination],
-        algorithm: ChecksumAlgorithm = .xxh64,
+        algorithm: ChecksumAlgorithm = .xxh3,
+        verificationProfile: VerificationProfile = .standard,
+        taskID: UUID? = nil,
+        operatorSnapshot: OperatorSnapshot? = nil,
+        projectID: UUID? = nil,
+        sourceFingerprint: String? = nil,
         spoolDirectory: URL,
         allowSameVolume: Bool = false,
-        requireNewOutputRoots: Bool = true
+        requireNewOutputRoots: Bool = true,
+        resumeManifest: TransferManifest? = nil,
+        retryManifest: TransferManifest? = nil,
+        includedRelativePaths: Set<String>? = nil,
+        duplicateManifests: [String: TransferManifest] = [:]
     ) {
         self.id = id
         self.sourceRoot = sourceRoot
         self.destinations = destinations
         self.algorithm = algorithm
+        self.verificationProfile = verificationProfile
+        self.taskID = taskID ?? id
+        self.operatorSnapshot = operatorSnapshot
+        self.projectID = projectID
+        self.sourceFingerprint = sourceFingerprint
         self.spoolDirectory = spoolDirectory
         self.allowSameVolume = allowSameVolume
         self.requireNewOutputRoots = requireNewOutputRoots
+        self.resumeManifest = resumeManifest
+        self.retryManifest = retryManifest
+        self.includedRelativePaths = includedRelativePaths
+        self.duplicateManifests = duplicateManifests
     }
 
     /// Stable short identifier used in generated file names.

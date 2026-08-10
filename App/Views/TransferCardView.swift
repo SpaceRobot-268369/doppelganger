@@ -82,6 +82,12 @@ struct TransferCardView: View {
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
             StatusDot(color: statusDotColor, active: session.isRunning)
+            OperatorAvatarView(
+                profile: session.operatorProfile,
+                avatarStore: model.productStore.avatars,
+                size: 28
+            )
+            .help("Started by \(session.operatorProfile.displayName)")
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.displayName)
                     .font(.title3.weight(.semibold))
@@ -93,6 +99,18 @@ struct TransferCardView: View {
             if session.isRunning {
                 ActivityBars()
                 Button {
+                    session.pause()
+                } label: {
+                    Label(session.pauseRequested ? "Pausing…" : "Pause", systemImage: "pause.fill")
+                }
+                .buttonStyle(.glass)
+                .disabled(
+                    session.pauseRequested
+                        || (session.progress.phase != .copying
+                            && session.progress.phase != .preReadingSource)
+                )
+                .help("Stop after the current complete file, then verify and record finished files")
+                Button {
                     session.cancel()
                 } label: {
                     Label(session.cancelRequested ? "Cancelling…" : "Cancel", systemImage: "stop.fill")
@@ -101,6 +119,21 @@ struct TransferCardView: View {
                 .tint(.red)
                 .disabled(session.cancelRequested)
             } else if session.isQueued {
+                Button { model.moveQueued(session, by: -1) } label: {
+                    Image(systemName: "arrow.up")
+                }
+                .buttonStyle(.glass)
+                .help("Move earlier in the queue")
+                Button { model.moveQueued(session, by: 1) } label: {
+                    Image(systemName: "arrow.down")
+                }
+                .buttonStyle(.glass)
+                .help("Move later in the queue")
+                Button { model.prioritizeQueued(session) } label: {
+                    Label("Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+                .buttonStyle(.glass)
+                .help("Move to the front of the queue")
                 Button {
                     model.withdraw(session)
                 } label: {
@@ -130,12 +163,15 @@ struct TransferCardView: View {
 
     private var headlineColor: Color {
         if session.headline.isProblem { return .red }
+        if session.report?.status == .transferredPendingVerification { return .yellow }
         guard session.isRunning else { return .secondary }
         return session.progress.phase == .verifying ? .cyan : .blue
     }
 
     private var statusDotColor: Color {
         if session.headline.isProblem { return .red }
+        if session.report?.status == .paused { return .blue }
+        if session.report?.status == .transferredPendingVerification { return .yellow }
         if session.report?.status == .verified { return .green }
         return session.isRunning ? .blue : .secondary
     }
@@ -172,6 +208,8 @@ struct TransferCardView: View {
         case .pending: return .pending
         case .copying: return .copying
         case .verifying: return .verifying
+        case .pendingVerification: return .pendingVerification
+        case .paused: return .pending
         case .verified: return .verified
         case .failed: return .problem
         }
@@ -274,6 +312,10 @@ struct TransferCardView: View {
         if let free = session.availableBytesByDestination[destination] {
             caption += " · \(Format.bytes(free)) free"
         }
+        let rate = session.destinationThroughput(destination)
+        if rate > 0 { caption += " · \(Format.rate(rate))" }
+        if let eta = session.destinationETA(destination) { caption += " · \(Format.eta(eta))" }
+        if session.isBottleneck(destination) { caption += " · bottleneck" }
         return caption
     }
 
@@ -283,6 +325,8 @@ struct TransferCardView: View {
         case .pending: return .secondary
         case .copying: return .blue
         case .verifying: return .cyan
+        case .pendingVerification: return .yellow
+        case .paused: return .blue
         case .verified: return .green
         case .failed: return .red
         }
@@ -295,6 +339,14 @@ struct TransferCardView: View {
             Image(systemName: "checkmark.circle")
                 .font(.title2)
                 .foregroundStyle(.green)
+        case .pendingVerification:
+            Image(systemName: "clock.badge.exclamationmark")
+                .font(.title2)
+                .foregroundStyle(.yellow)
+        case .paused:
+            Image(systemName: "pause.circle")
+                .font(.title2)
+                .foregroundStyle(.blue)
         case .failed:
             Image(systemName: "xmark.circle")
                 .font(.title2)
@@ -394,6 +446,11 @@ struct TransferCardView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if let contactSheetMessage = session.contactSheetMessage {
+                Text(contactSheetMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if session.showLog {
                 LogPanel(entries: session.logEntries)
             }
@@ -467,15 +524,56 @@ struct TransferCardView: View {
                     }
                     .buttonStyle(.glass)
                 }
-                if session.report?.status != .verified {
+                if session.report?.status == .verified {
                     Button {
-                        model.retryAsNewOffload(session)
+                        if let url = session.contactSheetURL {
+                            reveal(url)
+                        } else {
+                            Task { await model.generateContactSheet(for: session) }
+                        }
                     } label: {
-                        Label("Retry as New Offload", systemImage: "arrow.clockwise")
+                        Label(
+                            session.contactSheetURL == nil ? "Contact Sheet" : "Show Contact Sheet",
+                            systemImage: "rectangle.grid.3x2"
+                        )
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(session.contactSheetMessage == L10n.text("Generating contact sheet…"))
+                    .help("Create an optional JPEG preview after verification")
+                }
+                if session.report?.status == .paused {
+                    Button {
+                        model.resume(session)
+                    } label: {
+                        Label("Resume", systemImage: "play.fill")
                     }
                     .buttonStyle(.glassProminent)
                     .tint(.blue)
-                    .help("Opens a reviewed preflight for a new output folder; existing files are untouched")
+                    .help("Create a linked attempt and reuse only previously verified complete files")
+                } else if session.report?.status != .verified {
+                    if session.failedPairCount > 0 {
+                        Button {
+                            model.retryFailures(session)
+                        } label: {
+                            Label(
+                                "Retry \(session.failedPairCount) Failure\(session.failedPairCount == 1 ? "" : "s")",
+                                systemImage: "arrow.trianglehead.2.clockwise.rotate.90"
+                            )
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(.blue)
+                        .help("Create linked attempts for only the failed file/destination pairs")
+                    }
+                    Menu {
+                        Button("Retry as New Offload") {
+                            model.retryAsNewOffload(session)
+                        }
+                    } label: {
+                        Label("More", systemImage: "ellipsis")
+                    }
+                    .menuStyle(.button)
+                    .buttonStyle(.glass)
+                    .help("Open a reviewed preflight for a separate output folder")
                     if session.isRecovered {
                         Button {
                             session.cleanupGeneratedPartials()
@@ -486,6 +584,18 @@ struct TransferCardView: View {
                         .help("Removes only hidden staging files created by this interrupted transfer")
                     }
                 } else if session.canEjectSource {
+                    Menu {
+                        ForEach(session.destinations, id: \.self) { destination in
+                            Button(session.baseDestination(for: destination).lastPathComponent) {
+                                model.beginCascade(from: session, source: destination)
+                            }
+                        }
+                    } label: {
+                        Label("Cascade…", systemImage: "arrow.triangle.branch")
+                    }
+                    .menuStyle(.button)
+                    .buttonStyle(.glass)
+                    .help("Use a verified destination as the source of a separately evidenced onward task")
                     Button {
                         ejectSource()
                     } label: {
@@ -495,6 +605,19 @@ struct TransferCardView: View {
                     .tint(.green)
                     .disabled(isEjecting)
                     .help("Unmount and eject the verified source volume")
+                } else if session.report?.status == .verified {
+                    Menu {
+                        ForEach(session.destinations, id: \.self) { destination in
+                            Button(session.baseDestination(for: destination).lastPathComponent) {
+                                model.beginCascade(from: session, source: destination)
+                            }
+                        }
+                    } label: {
+                        Label("Cascade…", systemImage: "arrow.triangle.branch")
+                    }
+                    .menuStyle(.button)
+                    .buttonStyle(.glass)
+                    .help("Use a verified destination as the source of a separately evidenced onward task")
                 }
             }
             Button {
@@ -522,9 +645,9 @@ struct TransferCardView: View {
                 try NSWorkspace.shared.unmountAndEjectDevice(
                     at: URL(fileURLWithPath: sourceVolume.mountPath, isDirectory: true)
                 )
-                ejectMessage = "Source safely ejected."
+                ejectMessage = L10n.text("Source safely ejected.")
             } catch {
-                ejectMessage = "Could not eject source: \(error.localizedDescription)"
+                ejectMessage = L10n.format("Could not eject source: %@", error.localizedDescription)
             }
             isEjecting = false
         }
@@ -611,6 +734,7 @@ struct ConnectorView: View {
         case pending
         case copying
         case verifying
+        case pendingVerification
         case verified
         case problem
     }
@@ -659,6 +783,7 @@ struct ConnectorView: View {
         case .pending: .secondary.opacity(0.3)
         case .copying: .blue.opacity(0.55)
         case .verifying: .cyan.opacity(0.6)
+        case .pendingVerification: .yellow.opacity(0.7)
         case .verified: .green.opacity(0.55)
         case .problem: .red.opacity(0.6)
         }
@@ -675,12 +800,18 @@ struct ConnectorView: View {
         case .pending: .secondary
         case .copying: .blue
         case .verifying: .cyan
+        case .pendingVerification: .yellow
         case .verified: .green
         case .problem: .red
         }
         context.fill(circle, with: .color(color))
-        if state == .verified || state == .problem {
-            let symbol = Text(Image(systemName: state == .verified ? "checkmark" : "xmark"))
+        if state == .verified || state == .problem || state == .pendingVerification {
+            let symbolName = switch state {
+            case .verified: "checkmark"
+            case .pendingVerification: "clock"
+            default: "xmark"
+            }
+            let symbol = Text(Image(systemName: symbolName))
                 .font(.system(size: 8, weight: .bold))
                 .foregroundColor(.white)
             context.draw(symbol, at: point)

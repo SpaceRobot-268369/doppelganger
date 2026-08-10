@@ -16,6 +16,8 @@ struct ManifestsView: View {
     @State private var entries: [SpoolManifest] = []
     @State private var searchText = ""
     @State private var statusFilter: StatusFilter = .all
+    @State private var showingVerification = false
+    @State private var verificationReference: URL?
 
     private var filteredEntries: [SpoolManifest] {
         entries.filter { entry in
@@ -44,6 +46,13 @@ struct ManifestsView: View {
                     Label("Spool Folder", systemImage: "folder")
                 }
                 .buttonStyle(.glass)
+                Button {
+                    verificationReference = nil
+                    showingVerification = true
+                } label: {
+                    Label("Verify Existing…", systemImage: "checkmark.shield")
+                }
+                .buttonStyle(.glassProminent)
             }
             .padding(.horizontal, 24)
             .padding(.top, 20)
@@ -79,6 +88,9 @@ struct ManifestsView: View {
         .onAppear(perform: reload)
         .onChange(of: model.completeCount) {
             reload()
+        }
+        .sheet(isPresented: $showingVerification, onDismiss: reload) {
+            VerifyMediaSheet(model: model, referenceURL: verificationReference)
         }
     }
 
@@ -153,6 +165,15 @@ struct ManifestsView: View {
             .buttonStyle(.glass)
             .help("Reveal manifest in Finder")
             .accessibilityLabel("Reveal manifest in Finder")
+            Button {
+                verificationReference = entry.manifestURL
+                showingVerification = true
+            } label: {
+                Image(systemName: "arrow.clockwise.circle")
+            }
+            .buttonStyle(.glass)
+            .help("Verify an existing copy against this manifest")
+            .accessibilityLabel("Verify again")
         }
         .padding(14)
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: 14))
@@ -174,11 +195,22 @@ struct SpoolManifest: Identifiable {
     let summaryLine: String
     let finishedAt: String
 
-    var statusLabel: String { status.capitalized }
+    var statusLabel: String {
+        let key = switch status {
+        case "verified": "Verified"
+        case "paused": "Paused"
+        case "transferredPendingVerification": "Needs Verification"
+        case "cancelled": "Cancelled"
+        default: "Failed"
+        }
+        return L10n.text(key)
+    }
 
     var statusIcon: String {
         switch status {
         case "verified": "checkmark.seal.fill"
+        case "paused": "pause.circle.fill"
+        case "transferredPendingVerification": "clock.badge.exclamationmark.fill"
         case "cancelled": "exclamationmark.triangle.fill"
         default: "xmark.octagon.fill"
         }
@@ -187,6 +219,8 @@ struct SpoolManifest: Identifiable {
     var statusColor: Color {
         switch status {
         case "verified": .green
+        case "paused": .blue
+        case "transferredPendingVerification": .yellow
         case "cancelled": .orange
         default: .red
         }

@@ -39,8 +39,11 @@ struct TransfersView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
+    /// Starting a transfer must be reachable at any time, not only from the
+    /// empty state — the dashboard is busiest exactly when the next card
+    /// arrives.
     private var header: some View {
-        HStack {
+        HStack(alignment: .firstTextBaseline) {
             Text(model.activeCount > 0 ? "Active transfers" : "Transfers")
                 .font(.largeTitle.weight(.bold))
             Spacer()
@@ -48,12 +51,14 @@ struct TransfersView: View {
                 model.beginOffload()
             } label: {
                 Label("New Offload", systemImage: "plus")
-                    .padding(.horizontal, 4)
+                    .padding(.horizontal, 6)
             }
             .buttonStyle(.glassProminent)
             .tint(.blue)
-            .keyboardShortcut("n", modifiers: .command)
+            // ⌘N lives on the File menu command so it works on every page.
+            .help("Review and start a new offload")
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// Card detection removes selection friction, but still opens the review

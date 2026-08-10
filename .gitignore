@@ -19,6 +19,7 @@ xcuserdata/
 .build/
 Packages/
 Package.resolved
+!Doppelganger.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
 # Provider-local configuration (never tracked)
 .claude/settings.local.json

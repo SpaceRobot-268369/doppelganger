@@ -11,25 +11,25 @@ enum ReportFixtures {
     static let destinationA = URL(fileURLWithPath: "/Volumes/RAID/day01")
     static let destinationB = URL(fileURLWithPath: "/Volumes/Shuttle/day01")
 
-    static func verifiedReport() -> TransferReport {
+    static func verifiedReport(destinations: [URL] = [destinationA, destinationB]) -> TransferReport {
         TransferReport(
             id: transferID,
             status: .verified,
             algorithm: .xxh64,
             sourceRoot: source,
-            destinations: [destinationA, destinationB],
+            destinations: destinations,
             startedAt: started,
             finishedAt: finished,
             items: [
                 ItemResult(
                     item: SourceItem(relativePath: "DCIM/100MEDIA/A001.MP4", size: 1_234_567),
                     sourceDigest: "0123456789abcdef",
-                    outcomes: [destinationA: .verified, destinationB: .verified]
+                    outcomes: Dictionary(uniqueKeysWithValues: destinations.map { ($0, .verified) })
                 ),
                 ItemResult(
                     item: SourceItem(relativePath: "DCIM/100MEDIA/A002.MP4", size: 42),
                     sourceDigest: "fedcba9876543210",
-                    outcomes: [destinationA: .verified, destinationB: .verified]
+                    outcomes: Dictionary(uniqueKeysWithValues: destinations.map { ($0, .verified) })
                 ),
             ],
             manifestLocations: [destinationA, destinationB]

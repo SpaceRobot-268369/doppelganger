@@ -1,7 +1,7 @@
 import Foundation
 
 /// Persists the chosen source and destinations across launches. Plain paths,
-/// because the MVP is not sandboxed; a security-scoped-bookmark store replaces
+/// because the direct-distribution build is intentionally not sandboxed; a security-scoped-bookmark store replaces
 /// this type (and nothing else) when sandboxing arrives.
 protocol SelectionStore {
     func load() -> (source: URL?, destinations: [URL])

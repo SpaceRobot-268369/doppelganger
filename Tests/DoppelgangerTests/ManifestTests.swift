@@ -20,7 +20,7 @@ struct ManifestTests {
     @Test func verifiedReportProducesVerifiedManifest() {
         let manifest = TransferManifest(report: ReportFixtures.verifiedReport())
         #expect(manifest.status == "verified")
-        #expect(manifest.algorithm == "xxh64")
+        #expect(manifest.algorithm == "xxh64be")
         #expect(manifest.summary.itemCount == 2)
         #expect(manifest.summary.verifiedCount == 4)
         #expect(manifest.summary.failedCount == 0)

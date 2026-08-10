@@ -155,6 +155,16 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
         try base.moveItemExclusive(from: staging, to: final)
     }
 
+    func replaceGeneratedIndexAtomically(from staging: URL, to final: URL) throws {
+        if isGone(staging.path) || isGone(final.path) { throw FileSystemError.volumeGone }
+        try base.replaceGeneratedIndexAtomically(from: staging, to: final)
+    }
+
+    func setModificationTime(_ timeIntervalSince1970: TimeInterval, at url: URL) throws {
+        if isGone(url.path) { throw FileSystemError.volumeGone }
+        try base.setModificationTime(timeIntervalSince1970, at: url)
+    }
+
     func removeItem(at url: URL) throws {
         if isGone(url.path) { throw FileSystemError.volumeGone }
         try base.removeItem(at: url)

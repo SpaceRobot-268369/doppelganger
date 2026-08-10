@@ -1,6 +1,6 @@
 import Foundation
 
-/// The offload engine. One transfer at a time (MVP): `run` starts the
+/// The offload engine. One task per engine instance: `run` starts the
 /// pipeline on a detached task and returns its event stream; `cancel` requests
 /// a defined interruption — the manifest is still written and the stream still
 /// ends with `.finished`.
@@ -8,6 +8,7 @@ public actor TransferEngine {
     private let fileSystem: any FileSystemAccess
     private let sleepInhibitor: any SleepInhibiting
     private let configuration: TransferConfiguration
+    private let control = TransferControl()
     private var runTask: Task<Void, Never>?
 
     public init(
@@ -34,8 +35,10 @@ public actor TransferEngine {
         let fileSystem = fileSystem
         let configuration = configuration
         let sleepInhibitor = sleepInhibitor
+        let control = control
 
         runTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await control.reset()
             let sleepToken = sleepInhibitor.beginInhibition(reason: "Doppelganger transfer \(request.shortID)")
             defer { sleepToken.release() }
 
@@ -44,7 +47,8 @@ public actor TransferEngine {
                 request: request,
                 configuration: configuration,
                 fileSystem: fileSystem,
-                hub: hub
+                hub: hub,
+                control: control
             )
             await worker.run()
             await self?.clearRunTask()
@@ -54,6 +58,12 @@ public actor TransferEngine {
 
     public func cancel() {
         runTask?.cancel()
+    }
+
+    /// Requests a stop after the current complete source file reaches a safe
+    /// boundary. It does not cancel or truncate the file in flight.
+    public func pause() async {
+        await control.requestPause()
     }
 
     public var isRunning: Bool { runTask != nil }

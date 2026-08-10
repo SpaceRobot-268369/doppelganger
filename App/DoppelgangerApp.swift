@@ -35,9 +35,16 @@ struct DoppelgangerApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1120, height: 700)
         .commands {
+            // Reachable from anywhere in the app, whatever page is showing.
+            CommandGroup(replacing: .newItem) {
+                Button("New Offload") {
+                    model.beginOffload()
+                }
+                .keyboardShortcut("n", modifiers: .command)
+            }
             CommandGroup(replacing: .appSettings) {
                 Button("Preferences…") {
-                    model.section = .preferences
+                    model.selectSection(.preferences)
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
