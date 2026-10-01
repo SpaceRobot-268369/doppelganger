@@ -543,10 +543,13 @@ struct OffloadPlanGraph: View {
     }
 }
 
-private extension NSItemProvider {
+extension NSItemProvider {
     /// Finder's drag payload as a file URL. `loadObject` handles both the
     /// in-place file URLs Finder provides and bookmark-backed items.
-    func resolvedFileURL() async -> URL? {
+    ///
+    /// `nonisolated(nonsending)` runs it on the caller's actor, so the
+    /// main-actor drop handler never has to send this non-Sendable provider.
+    nonisolated(nonsending) func resolvedFileURL() async -> URL? {
         await withCheckedContinuation { continuation in
             _ = loadObject(ofClass: URL.self) { url, _ in
                 continuation.resume(returning: url)
