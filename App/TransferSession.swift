@@ -323,6 +323,14 @@ final class TransferSession: Identifiable {
         case .log(let entry):
             logEntries.append(entry)
             logStore?.append(entry)
+        case .mhlGenerationWritten(let destination, let generationURL, let chainURL, let archiveURL):
+            journal.mhlGenerations = (journal.mhlGenerations ?? []) + [MHLGenerationRecord(
+                destination: destination,
+                generationURL: generationURL,
+                chainURL: chainURL,
+                archiveURL: archiveURL
+            )]
+            journalStore.save(journal)
         case .finished(let finished):
             logStore?.close()
             logStore = nil
@@ -353,7 +361,7 @@ final class TransferSession: Identifiable {
     private var lastKnownFraction: Double {
         let total = Double(planTotalBytes) * Double(workPassCount)
         guard total > 0 else { return 0 }
-        let done = Double(progress.copiedBytes) +
+        let done = Double(progress.preReadBytes) + Double(progress.copiedBytes) +
             Double(progress.verifiedBytesByDestination.values.reduce(0, +))
         return min(done / total, 1)
     }
@@ -362,7 +370,7 @@ final class TransferSession: Identifiable {
         guard isActive, let runStarted else { return 0 }
         let elapsed = Date().timeIntervalSince(runStarted)
         guard elapsed > 0.5 else { return 0 }
-        let done = Double(progress.copiedBytes) +
+        let done = Double(progress.preReadBytes) + Double(progress.copiedBytes) +
             Double(progress.verifiedBytesByDestination.values.reduce(0, +))
         return done / elapsed
     }
@@ -371,7 +379,7 @@ final class TransferSession: Identifiable {
         let rate = throughputBytesPerSecond
         guard rate > 0 else { return nil }
         let total = Double(planTotalBytes) * Double(workPassCount)
-        let done = Double(progress.copiedBytes) +
+        let done = Double(progress.preReadBytes) + Double(progress.copiedBytes) +
             Double(progress.verifiedBytesByDestination.values.reduce(0, +))
         guard total > done else { return 0 }
         return (total - done) / rate
@@ -379,7 +387,8 @@ final class TransferSession: Identifiable {
 
     /// Bytes finished so far across copy + verify, for the "24.7 GB of 36.2 GB" line.
     var doneBytes: Int64 {
-        progress.copiedBytes + progress.verifiedBytesByDestination.values.reduce(0, +)
+        progress.preReadBytes + progress.copiedBytes
+            + progress.verifiedBytesByDestination.values.reduce(0, +)
     }
 
     var workBudgetBytes: Int64 {

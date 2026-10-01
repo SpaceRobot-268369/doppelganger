@@ -40,6 +40,9 @@ struct TransferWorker {
     /// zero items must not read as a vacuous success.
     private var vetoed = false
     private var transferIssues: [String] = []
+    /// Fix-up bookkeeping for destinations whose filesystem refused to
+    /// preserve source timestamps: destination → (first issue index, count).
+    private var timestampWarnings: [URL: (issueIndex: Int, count: Int)] = [:]
     private let startedAt = Date()
 
     init(
@@ -157,6 +160,7 @@ struct TransferWorker {
 
         await preflightDestinations(totalBytes: totalBytes)
         await verifyDuplicateCandidates()
+        await confirmRemainingCapacity()
         if request.verificationProfile == .maximum {
             await preReadSource()
         }
@@ -255,14 +259,64 @@ struct TransferWorker {
                 )
                 continue
             }
-            let reserve = max(Int64(512 * 1024 * 1024), totalBytes / 20)
-            if !duplicateCandidate,
-               let free = try? fileSystem.freeSpace(at: requested.baseRoot), free < totalBytes + reserve {
+            // A duplicate manifest only excuses the bytes it can plausibly
+            // prove; everything else still has to fit. A plan it covers
+            // entirely writes no media, so it needs no headroom up front —
+            // `confirmRemainingCapacity()` re-checks whatever proof fails.
+            let remainder = totalBytes - duplicateCandidateBytes(at: destination)
+            let needed = remainder + Self.reserveBytes(for: totalBytes)
+            if remainder > 0, let free = try? fileSystem.freeSpace(at: requested.baseRoot), free < needed {
                 await failWholeDestination(destination, reason: .destinationFull,
                                            log: "Destination \(requested.baseRoot.path) has " +
                                            "\(MarkdownReportWriter.byteString(free)) free, needs " +
-                                           MarkdownReportWriter.byteString(totalBytes + reserve))
+                                           MarkdownReportWriter.byteString(needed))
             }
+        }
+    }
+
+    /// Working headroom kept free beyond the bytes themselves.
+    static func reserveBytes(for totalBytes: Int64) -> Int64 {
+        max(Int64(512 * 1024 * 1024), totalBytes / 20)
+    }
+
+    /// Bytes a prior verified manifest at `destination` might let the
+    /// duplicate flow skip: same relative path and size, a recorded digest,
+    /// and a verified result at that destination. Only a candidate — the
+    /// exact gate after `verifyDuplicateCandidates()` settles it.
+    private func duplicateCandidateBytes(at destination: URL) -> Int64 {
+        guard let manifest = request.duplicateManifests[destination.path] else { return 0 }
+        let records = Dictionary(manifest.items.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
+        return items.reduce(Int64(0)) { sum, item in
+            guard let record = records[item.relativePath],
+                  record.size == item.size,
+                  record.digest != nil,
+                  record.results.contains(where: {
+                      $0.destination == destination.path && $0.status == "verified"
+                  })
+            else { return sum }
+            return sum + item.size
+        }
+    }
+
+    /// Exact capacity gate once the duplicate flow has proven what it can:
+    /// every pair not already verified at a live destination still has to be
+    /// written there, and must fit beside the reserve before a byte lands.
+    private mutating func confirmRemainingCapacity() async {
+        guard !sourceDead, !cancelled else { return }
+        let totalBytes = items.reduce(Int64(0)) { $0 + $1.size }
+        for requested in request.destinations {
+            let destination = requested.outputRoot
+            guard !deadDestinations.contains(destination) else { continue }
+            let remaining = items.reduce(Int64(0)) { sum, item in
+                outcomes[item.relativePath]?[destination]?.isVerified == true ? sum : sum + item.size
+            }
+            guard remaining > 0 else { continue }
+            let needed = remaining + Self.reserveBytes(for: totalBytes)
+            guard let free = try? fileSystem.freeSpace(at: requested.baseRoot), free < needed else { continue }
+            await failRemainingPairs(destination, reason: .destinationFull,
+                                     log: "Destination \(requested.baseRoot.path) has " +
+                                     "\(MarkdownReportWriter.byteString(free)) free, needs " +
+                                     "\(MarkdownReportWriter.byteString(needed)) for the unverified remainder")
         }
     }
 
@@ -304,6 +358,17 @@ struct TransferWorker {
         }
     }
 
+    /// Like `failWholeDestination`, but pairs this destination has already
+    /// verified (a resumed attempt or a digest-proven duplicate) keep that
+    /// outcome; only the still-unverified remainder is failed.
+    private mutating func failRemainingPairs(_ destination: URL, reason: ItemFailureReason, log message: String) async {
+        deadDestinations.insert(destination)
+        await hub.log(.error, message)
+        for item in items where outcomes[item.relativePath]?[destination]?.isVerified != true {
+            await record(item.relativePath, destination, .failed(reason))
+        }
+    }
+
     // MARK: - Copy pass
 
     private mutating func preReadSource() async {
@@ -327,6 +392,7 @@ struct TransferWorker {
                     buffer.withUnsafeBytes { raw in
                         hasher.update(UnsafeRawBufferPointer(rebasing: raw[0..<count]))
                     }
+                    await hub.addPreReadBytes(count)
                 }
                 preReadDigests[item.relativePath] = hasher.hexDigest()
                 if await control.shouldPause() {
@@ -396,7 +462,10 @@ struct TransferWorker {
                         destination: destination
                     ) else { throw FileSystemError.alreadyExists }
                 }
-                let stream = WriterStreamBox(try fileSystem.openForWritingExclusive(staging))
+                let stream = WriterStreamBox(try fileSystem.openForWritingExclusive(
+                    staging,
+                    durability: request.verificationProfile == .maximum ? .full : .standard
+                ))
                 let channel = BoundedAsyncChannel<[UInt8]>(capacity: 2)
                 let progressHub = hub
                 let writerTask = Task.detached(priority: .userInitiated) { () -> FileSystemError? in
@@ -556,8 +625,15 @@ struct TransferWorker {
         for writer in successfulWriters {
             do {
                 try fileSystem.moveItemExclusive(from: writer.staging, to: writer.target)
+                // The bytes are published and will be independently verified.
+                // A filesystem that refuses the timestamp (some exFAT and SMB
+                // mounts) costs a warning, not the destination.
                 if let modificationTime = item.modificationTime {
-                    try fileSystem.setModificationTime(modificationTime, at: writer.target)
+                    do {
+                        try fileSystem.setModificationTime(modificationTime, at: writer.target)
+                    } catch {
+                        await noteTimestampNotPreserved(at: writer.destination, item: item, error: error)
+                    }
                 }
                 pendingVerify[writer.destination, default: []].append((item, digest))
                 pendingPaths[writer.destination, default: []].insert(item.relativePath)
@@ -597,6 +673,24 @@ struct TransferWorker {
             await record(item.relativePath, destination, .failed(.sourceChanged))
         }
         await hub.log(.error, "\(item.relativePath): source changed during transfer")
+    }
+
+    /// One transfer-level warning per destination, updated in place with a
+    /// running count so the report never fills with one line per file.
+    private mutating func noteTimestampNotPreserved(at destination: URL, item: SourceItem, error: Error) async {
+        await hub.log(.warning, "\(item.relativePath): could not preserve source timestamp at " +
+            "\(destination.path) — \(describe(error)); bytes are published and will be verified")
+        let count = (timestampWarnings[destination]?.count ?? 0) + 1
+        let message = "Warning: could not preserve source timestamps on \(count) file(s) at " +
+            "\(destination.path); file contents are unaffected, but a later cascade from this destination " +
+            "will see a different source-plan fingerprint."
+        if let existing = timestampWarnings[destination] {
+            transferIssues[existing.issueIndex] = message
+            timestampWarnings[destination] = (existing.issueIndex, count)
+        } else {
+            transferIssues.append(message)
+            timestampWarnings[destination] = (transferIssues.count - 1, count)
+        }
     }
 
     private mutating func destinationFailed(_ destination: URL, item: SourceItem, error: Error) async {
@@ -1031,6 +1125,17 @@ struct TransferWorker {
                     ) {
                         receipts.append(receipt)
                     }
+                }
+                // Every generation landed. Tell the session where they are so
+                // an interrupted finalization can be rolled back on relaunch;
+                // the generation filenames alone do not name this transfer.
+                for receipt in receipts {
+                    await hub.mhlGenerationWritten(
+                        destination: receipt.destination,
+                        generationURL: receipt.generationURL,
+                        chainURL: receipt.chainURL,
+                        archiveURL: receipt.archiveURL
+                    )
                 }
             } catch {
                 for receipt in receipts.reversed() {

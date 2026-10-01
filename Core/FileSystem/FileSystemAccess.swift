@@ -42,6 +42,16 @@ public struct FileSystemVolume: Sendable, Hashable, Codable {
     }
 }
 
+/// How hard a write stream's `close()` pushes bytes toward the platter.
+/// `standard` is `fsync(2)`, which on macOS flushes the kernel's buffers but
+/// leaves the drive's own write cache alone; `full` is `F_FULLFSYNC`, which
+/// asks the drive to commit as well and is what the Maximum verification
+/// profile uses for media staging files.
+public enum WriteDurability: Sendable, Equatable {
+    case standard
+    case full
+}
+
 /// Core's only window onto storage. Platform implements it with real POSIX
 /// I/O; tests implement or decorate it with scratch-directory fakes and fault
 /// injection. Core never touches `FileManager` directly.
@@ -72,7 +82,8 @@ public protocol FileSystemAccess: Sendable {
 
     /// Open a brand-new file for writing (exclusive create). An existing file
     /// throws `FileSystemError.alreadyExists` — the engine's name collision.
-    func openForWritingExclusive(_ url: URL) throws -> any FileWriteStream
+    /// `durability` decides how far `close()` flushes; see `WriteDurability`.
+    func openForWritingExclusive(_ url: URL, durability: WriteDurability) throws -> any FileWriteStream
 
     /// Atomically publish a fully flushed staging file without overwriting an
     /// existing final path.
@@ -93,6 +104,14 @@ public protocol FileSystemAccess: Sendable {
 
     /// Free bytes on the volume containing `url`.
     func freeSpace(at url: URL) throws -> Int64
+}
+
+public extension FileSystemAccess {
+    /// Standard-durability exclusive create; evidence files and non-Maximum
+    /// media use this.
+    func openForWritingExclusive(_ url: URL) throws -> any FileWriteStream {
+        try openForWritingExclusive(url, durability: .standard)
+    }
 }
 
 public protocol FileReadStream: AnyObject {
