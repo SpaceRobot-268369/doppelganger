@@ -542,38 +542,39 @@ struct TransferCardView: View {
                     .help("Create an optional JPEG preview after verification")
                 }
                 if session.report?.status == .paused {
-                    Button {
-                        model.resume(session)
-                    } label: {
-                        Label("Resume", systemImage: "play.fill")
+                    if model.continuation(of: session.id) == .open {
+                        Button {
+                            model.resume(session)
+                        } label: {
+                            Label("Resume", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.glassProminent)
+                        .tint(.blue)
+                        .help("Create a linked attempt and reuse only previously verified complete files")
+                    } else {
+                        continuedNote
                     }
-                    .buttonStyle(.glassProminent)
-                    .tint(.blue)
-                    .help("Create a linked attempt and reuse only previously verified complete files")
+                    // Resume refuses when a destination lost its paused record
+                    // and points here: a fresh offload in a new folder.
+                    retryAsNewOffloadMenu
                 } else if session.report?.status != .verified {
-                    if session.failedPairCount > 0 {
+                    let retryable = model.retryableFailedPairCount(for: session)
+                    if retryable > 0 {
                         Button {
                             model.retryFailures(session)
                         } label: {
                             Label(
-                                "Retry \(session.failedPairCount) Failure\(session.failedPairCount == 1 ? "" : "s")",
+                                "Retry \(retryable) Failure\(retryable == 1 ? "" : "s")",
                                 systemImage: "arrow.trianglehead.2.clockwise.rotate.90"
                             )
                         }
                         .buttonStyle(.glassProminent)
                         .tint(.blue)
                         .help("Create linked attempts for only the failed file/destination pairs")
+                    } else if session.failedPairCount > 0 {
+                        continuedNote
                     }
-                    Menu {
-                        Button("Retry as New Offload") {
-                            model.retryAsNewOffload(session)
-                        }
-                    } label: {
-                        Label("More", systemImage: "ellipsis")
-                    }
-                    .menuStyle(.button)
-                    .buttonStyle(.glass)
-                    .help("Open a reviewed preflight for a separate output folder")
+                    retryAsNewOffloadMenu
                     if session.isRecovered {
                         Button {
                             session.cleanupGeneratedPartials()
@@ -583,28 +584,6 @@ struct TransferCardView: View {
                         .buttonStyle(.glass)
                         .help("Removes only hidden staging files created by this interrupted transfer")
                     }
-                } else if session.canEjectSource {
-                    Menu {
-                        ForEach(session.destinations, id: \.self) { destination in
-                            Button(session.baseDestination(for: destination).lastPathComponent) {
-                                model.beginCascade(from: session, source: destination)
-                            }
-                        }
-                    } label: {
-                        Label("Cascade…", systemImage: "arrow.triangle.branch")
-                    }
-                    .menuStyle(.button)
-                    .buttonStyle(.glass)
-                    .help("Use a verified destination as the source of a separately evidenced onward task")
-                    Button {
-                        ejectSource()
-                    } label: {
-                        Label(isEjecting ? "Ejecting…" : "Eject Source", systemImage: "eject.fill")
-                    }
-                    .buttonStyle(.glassProminent)
-                    .tint(.green)
-                    .disabled(isEjecting)
-                    .help("Unmount and eject the verified source volume")
                 } else if session.report?.status == .verified {
                     Menu {
                         ForEach(session.destinations, id: \.self) { destination in
@@ -618,6 +597,7 @@ struct TransferCardView: View {
                     .menuStyle(.button)
                     .buttonStyle(.glass)
                     .help("Use a verified destination as the source of a separately evidenced onward task")
+                    sourceEjectControl
                 }
             }
             Button {
@@ -636,19 +616,73 @@ struct TransferCardView: View {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    /// A fresh reviewed offload of this attempt's task into a new folder; the
+    /// folder this attempt wrote stays as it is.
+    private var retryAsNewOffloadMenu: some View {
+        Menu {
+            Button("Retry as New Offload") {
+                model.retryAsNewOffload(session)
+            }
+        } label: {
+            Label("More", systemImage: "ellipsis")
+        }
+        .menuStyle(.button)
+        .buttonStyle(.glass)
+        .help("Open a reviewed preflight for a separate output folder")
+    }
+
+    /// Shown where Resume or Retry was: a linked attempt already continues
+    /// this one, and that attempt's card carries the next action.
+    private var continuedNote: some View {
+        Label("Continued in a linked attempt", systemImage: "arrow.turn.down.right")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .help("A resume or repair attempt already continues this one. Use that attempt's card; continuing this one again would collide with the files it published.")
+    }
+
+    /// Offered only while the verified card itself is still mounted at its
+    /// recorded mount point and no other queued or running transfer uses it.
+    @ViewBuilder
+    private var sourceEjectControl: some View {
+        switch session.sourceEjectEligibility(among: model.sessions, mounted: model.volumeWatcher.volumes) {
+        case .available:
+            Button {
+                ejectSource()
+            } label: {
+                Label(isEjecting ? "Ejecting…" : "Eject Source", systemImage: "eject.fill")
+            }
+            .buttonStyle(.glassProminent)
+            .tint(.green)
+            .disabled(isEjecting)
+            .help("Unmount and eject the verified source volume")
+        case .inUse:
+            // Orange means warning; the label carries the meaning, not colour alone.
+            Button {} label: {
+                Label("Source In Use", systemImage: "eject")
+            }
+            .buttonStyle(.glass)
+            .tint(.orange)
+            .disabled(true)
+            .help("Another queued or running transfer still uses this source volume. Eject becomes available when it finishes.")
+        case .notOffered, .identityUnverifiable, .sourceGone, .differentVolumeMounted:
+            EmptyView()
+        }
+    }
+
     private func ejectSource() {
-        guard let sourceVolume = session.sourceVolume else { return }
         isEjecting = true
         ejectMessage = nil
         Task {
-            do {
-                try NSWorkspace.shared.unmountAndEjectDevice(
-                    at: URL(fileURLWithPath: sourceVolume.mountPath, isDirectory: true)
-                )
-                ejectMessage = L10n.text("Source safely ejected.")
-            } catch {
-                ejectMessage = L10n.format("Could not eject source: %@", error.localizedDescription)
+            // Fresh mount state, then every check again. The unmount runs in
+            // the same main-actor turn as the last check.
+            model.volumeWatcher.refresh()
+            let outcome = session.ejectSource(
+                among: model.sessions,
+                mounted: model.volumeWatcher.volumes
+            ) { mountPoint in
+                try NSWorkspace.shared.unmountAndEjectDevice(at: mountPoint)
             }
+            ejectMessage = outcome.message
             isEjecting = false
         }
     }

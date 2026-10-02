@@ -95,6 +95,67 @@ enum TransferFilter: String, CaseIterable, Identifiable {
     }
 }
 
+/// The reviewed scope a resumed attempt carries forward.
+struct ResumeScope: Equatable, Sendable {
+    /// The exact items to transfer, or `nil` for the whole source.
+    let includedRelativePaths: Set<String>?
+    /// The paused plan's identity; the engine refuses a plan that differs.
+    let sourceFingerprint: String
+}
+
+/// Why a Resume may not proceed, worded for the operator.
+struct ResumeRefusal: LocalizedError, Equatable {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// Whether an attempt may still be resumed or repaired from its own card.
+enum ContinuationAvailability: Equatable, Sendable {
+    /// No linked attempt has taken over any of its destinations.
+    case open
+    /// Linked resume or repair attempts own these output roots. Continuing the
+    /// parent there again would run against files they already published.
+    case continued(Set<URL>)
+}
+
+/// Which destinations of an attempt a linked resume or repair attempt has
+/// taken over. Each destination is continued at most once; the operator
+/// carries on from the newest attempt's card.
+struct AttemptContinuations: Equatable, Sendable {
+    /// parent attempt → linked child attempt → output roots it took over.
+    private var claims: [UUID: [UUID: Set<URL>]] = [:]
+
+    /// `.continued` as soon as any child exists, even one that took over no
+    /// destination, so a degenerate parent still fails closed.
+    func availability(of attemptID: UUID) -> ContinuationAvailability {
+        guard let children = claims[attemptID], !children.isEmpty else { return .open }
+        return .continued(children.values.reduce(into: Set<URL>()) { $0.formUnion($1) })
+    }
+
+    mutating func claim(_ destinations: [URL], of parentID: UUID, by childID: UUID) {
+        claims[parentID, default: [:]][childID, default: []].formUnion(destinations)
+    }
+
+    /// A linked attempt that wrote nothing (withdrawn before it started, or
+    /// stopped before any destination) holds nothing, so what it alone held
+    /// is open again.
+    mutating func release(child childID: UUID) {
+        for parentID in Array(claims.keys) {
+            claims[parentID]?.removeValue(forKey: childID)
+            if claims[parentID]?.isEmpty == true { claims.removeValue(forKey: parentID) }
+        }
+    }
+
+    /// A linked attempt finished. One the engine stopped before it reached
+    /// any destination (a different card at the same path, a pulled card, a
+    /// changed plan) never took its parent's destinations over, so the parent
+    /// can be continued again once the cause is fixed. Any other end keeps
+    /// the claim.
+    mutating func settle(child childID: UUID, with report: TransferReport) {
+        if report.neverReachedDestinations { release(child: childID) }
+    }
+}
+
 /// Top-level dashboard state: the session list, sidebar routing, the
 /// New Offload draft, and recents. Sessions run their own engines; this model
 /// only orchestrates them.
@@ -107,8 +168,16 @@ final class AppModel {
     static let verificationProfileKey = "prefs.verificationProfile"
     static let automaticCameraDetectionKey = "prefs.automaticCameraDetection"
     static let automaticContactSheetKey = "prefs.automaticContactSheet"
+    /// Shown, like the interrupted-run issue, on a paused or Fast-pending card
+    /// whose saved record does not check out. Issue text stays in the
+    /// evidence register (English), as the existing recovered issue does.
+    static let unreadableOfferIssue = "The saved record of this paused or unverified transfer could not be read, so it cannot be resumed or verified from here. Treat every output as incomplete and keep the source media."
 
     private(set) var sessions: [TransferSession] = []
+    /// Linked resume/repair attempts already created from each attempt, so a
+    /// second click, or a card restored after relaunch, cannot start a
+    /// duplicate. Observed by the card's action row.
+    private(set) var continuations = AttemptContinuations()
     var section: SidebarSection = .transfers
     var filter: TransferFilter = .all
     /// New Offload is a secondary page over the detail area, not a modal.
@@ -149,6 +218,10 @@ final class AppModel {
     /// derived from the reel, never typed. Cascade and retry set their own,
     /// because they must not land in the folder they came from.
     private(set) var draftName = ""
+    /// The date every folder in this draft is stamped with, fixed whenever
+    /// the primary's name is derived. A batch's other sources take it too, so
+    /// a review that runs past midnight still names every card for one day.
+    private(set) var draftFolderDate = Date()
     /// Whether this transfer creates a folder in each destination or writes
     /// straight into it.
     var draftDestinationLayout: DestinationLayout = .newFolder
@@ -192,6 +265,8 @@ final class AppModel {
 
     private let selectionStore: any SelectionStore
     private let recents: RecentsStore
+    private let journalStore: TransferJournalStore
+    private let clock: () -> Date
     private let notifier = TransferNotifier()
     private let dockProgress = DockProgressController()
     private var dockTimer: Timer?
@@ -202,11 +277,16 @@ final class AppModel {
         productStore: ProductStore = ProductStore(),
         // Injectable so tests never run journal recovery against the real
         // spool, which rewrites unfinished journals and clears staging files.
-        spoolRoot: URL = TransferSession.spoolDirectory
+        spoolRoot: URL = TransferSession.spoolDirectory,
+        // Folder date stamps read this, so tests can cross midnight.
+        clock: @escaping () -> Date = Date.init
     ) {
         self.selectionStore = selectionStore
         self.recents = recents
         self.productStore = productStore
+        journalStore = TransferJournalStore(root: spoolRoot)
+        self.clock = clock
+        draftFolderDate = clock()
         let defaults = UserDefaults.standard
         if let value = defaults.string(forKey: Self.checksumAlgorithmKey),
            let algorithm = ChecksumAlgorithm(rawValue: value) {
@@ -220,7 +300,7 @@ final class AppModel {
         draftSource = saved.source
         draftDestinations = saved.destinations
         if let source = saved.source {
-            draftName = TransferPreflight.defaultFolderName(for: source)
+            draftName = TransferPreflight.defaultFolderName(for: source, at: draftFolderDate)
         }
         recentSources = recents.sources()
         recentDestinations = recents.destinations()
@@ -228,8 +308,36 @@ final class AppModel {
            let saved = try? JSONDecoder().decode([String: DestinationBenchmarkResult].self, from: data) {
             destinationBenchmarks = saved
         }
-        let journalStore = TransferJournalStore(root: spoolRoot)
-        sessions = journalStore.recoverInterrupted().map(TransferSession.init(interrupted:))
+        // Unfinished runs come back once, as interrupted. Paused and
+        // Fast-pending attempts come back on every launch until resumed or
+        // removed, so a quit never takes their Resume (or Verify) with it.
+        // A queued run that never started wrote nothing: like the quit alert
+        // and the catalog, which closes it as cancelled, it gets no card.
+        let interrupted = journalStore.recoverInterrupted()
+            .filter { $0.startedAt != nil }
+            .map { TransferSession(interrupted: $0) }
+        let offered = journalStore.launchOffers().map { offer -> TransferSession in
+            switch offer {
+            case .restorable(let attempt):
+                TransferSession(restoring: attempt)
+            case .unreadable(let journal):
+                TransferSession(interrupted: journal, issue: Self.unreadableOfferIssue)
+            }
+        }
+        sessions = (interrupted + offered).sorted { $0.createdAt < $1.createdAt }
+        // Nothing of this launch has started yet, so any attempt the catalog
+        // still holds open was abandoned by an earlier process: close it the
+        // way the recovered card reads — failed. A queued task that never
+        // started closes as cancelled.
+        productStore.closeAbandonedRuns(before: Date())
+        // Linked attempts that took their parent's destinations over in an
+        // earlier launch still own them, so a restored card cannot offer that
+        // parent's Resume or Retry again. One the engine stopped before any
+        // destination took nothing over; its parent is offered as it was.
+        for journal in journalStore.startedContinuations() {
+            guard let parentID = journal.parentAttemptID else { continue }
+            continuations.claim(journal.destinations, of: parentID, by: journal.id)
+        }
         volumeWatcher.onCardMounted = { [weak self] volume in
             guard UserDefaults.standard.bool(forKey: Self.automaticCameraDetectionKey) else { return }
             self?.mountBanner = volume
@@ -328,7 +436,9 @@ final class AppModel {
     func refreshDraftFolderName() {
         guard draftAttemptKind == .copy else { return }
         let reel = draftReelName
-        draftName = reel.isEmpty ? "" : TransferPreflight.defaultFolderName(reel: reel)
+        // The one date every folder in this draft is named for.
+        draftFolderDate = clock()
+        draftName = reel.isEmpty ? "" : TransferPreflight.defaultFolderName(reel: reel, at: draftFolderDate)
     }
 
     /// Cascade and retry name their own output; everything else is derived.
@@ -348,13 +458,48 @@ final class AppModel {
     func remove(_ session: TransferSession) {
         guard !session.isActive else { return }
         sessions.removeAll { $0.id == session.id }
+        // A paused or Fast-pending card would otherwise return at the next
+        // launch; removing it is the operator letting it go. A no-op for any
+        // other journal.
+        journalStore.stopOffering(session.id)
     }
 
     /// Take a queued session out of line. Running sessions must be cancelled
     /// through the engine instead — their card offers Cancel, not this.
     func withdraw(_ session: TransferSession) {
         guard session.isQueued else { return }
+        // A linked attempt that never started wrote nothing; its parent's
+        // destinations may be continued again.
+        continuations.release(child: session.id)
         sessions.removeAll { $0.id == session.id }
+        // The task was cataloged at enqueue; close it now rather than leave a
+        // Pending task under Projects > Active that will never run.
+        productStore.withdrawQueuedTask(id: session.taskID)
+    }
+
+    /// What quitting now would cost. Running work is interrupted and queued
+    /// work never starts. A paused or Fast-pending attempt returns at the next
+    /// launch, or is carried on by a linked attempt that took it over, so it
+    /// counts only when neither holds: ask rather than lose it silently.
+    var quitImpact: QuitImpact {
+        var impact = QuitImpact()
+        var offered: [UUID] = []
+        for session in sessions {
+            if session.isRunning {
+                impact.running += 1
+            } else if session.isQueued {
+                impact.queued += 1
+            } else if let status = session.report?.status,
+                      status == .paused || status == .transferredPendingVerification {
+                offered.append(session.id)
+            }
+        }
+        if !offered.isEmpty {
+            // The same rules the next launch applies, read once.
+            let fates = journalStore.launchFates(of: offered)
+            impact.unrecoverable = offered.filter { (fates[$0] ?? .lost) == .lost }.count
+        }
+        return impact
     }
 
     /// A failed/interrupted transfer is retried as a fresh reviewed offload in
@@ -370,7 +515,34 @@ final class AppModel {
             .replacingOccurrences(of: "T", with: "-")
         setExplicitDraftName(TransferPreflight.validFolderName("\(session.label)-retry-\(stamp)"))
         draftAlgorithm = session.algorithm
+        // The new offload reviews exactly what the task was asked to copy.
+        // The draft holds only this source now, so stale picks go too.
+        draftSourceSelections = [:]
+        setDraftSelection(reviewedScope(of: session), for: session.source.standardizedFileURL)
         presentNewOffload()
+    }
+
+    /// The items the operator reviewed for this attempt's task, or `nil` for
+    /// the whole source. A copy, resume or cascade carries its own. A repair
+    /// covers only the pairs that failed at one destination, so it defers to
+    /// the attempt it repairs; when that attempt is no longer known, the
+    /// whole source is reviewed again rather than the failed subset.
+    func reviewedScope(of session: TransferSession) -> Set<String>? {
+        guard session.attemptKind == .retry else { return session.includedRelativePaths }
+        var visited: Set<UUID> = [session.id]
+        var next = session.parentAttemptID
+        while let id = next, visited.insert(id).inserted {
+            if let parent = sessions.first(where: { $0.id == id }) {
+                guard parent.attemptKind == .retry else { return parent.includedRelativePaths }
+                next = parent.parentAttemptID
+            } else if let parent = journalStore.load(id) {
+                guard parent.attemptKind == .retry else { return parent.includedRelativePaths.map { Set($0) } }
+                next = parent.parentAttemptID
+            } else {
+                return nil
+            }
+        }
+        return nil
     }
 
     /// Create one linked repair attempt per affected destination. Keeping each
@@ -388,12 +560,12 @@ final class AppModel {
             return
         }
 
+        // A destination is repaired at most once from this card: a second
+        // repair would run against the copies the first one published.
+        let availability = continuation(of: failedSession.id)
         var retries: [TransferSession] = []
-        for destination in failedSession.destinations {
-            let paths = Set(report.items.compactMap { item -> String? in
-                if case .failed = item.outcomes[destination] { return item.item.relativePath }
-                return nil
-            })
+        for destination in Self.repairableDestinations(failedSession.destinations, availability: availability) {
+            let paths = Self.failedRelativePaths(in: report, at: destination)
             guard !paths.isEmpty else { continue }
             let retry = TransferSession(
                 taskID: failedSession.taskID,
@@ -419,8 +591,14 @@ final class AppModel {
             retries.append(retry)
         }
         guard !retries.isEmpty else {
-            productStore.reportError(L10n.text("This attempt has no failed file/destination pairs to retry."))
+            productStore.reportError(
+                continuationRefusal(availability)
+                    ?? L10n.text("This attempt has no failed file/destination pairs to retry.")
+            )
             return
+        }
+        for retry in retries {
+            continuations.claim(retry.destinations, of: failedSession.id, by: retry.id)
         }
         if let index = sessions.firstIndex(where: { $0.id == failedSession.id }) {
             sessions.insert(contentsOf: retries, at: index + 1)
@@ -592,21 +770,22 @@ final class AppModel {
 
     // MARK: - Draft folder names
 
-    /// The output folder name for one source. The primary source uses the
-    /// reviewed reel; a batch's other sources use the reel their own name
-    /// implies, defaulting to the next tape so two unnamed cards never resolve
-    /// to one folder. Both follow the same `YYYYMMDD_REEL` convention.
+    /// The output folder name for one source. The primary uses the reviewed
+    /// reel; every other source uses the reel `draftSourceReels` gives it, so
+    /// two cards never default to one folder. Both follow `YYYYMMDD_REEL`,
+    /// dated `draftFolderDate`, never the clock at the moment of asking.
+    /// A source that is not in the draft has no folder, so nothing matches it.
     func draftFolderName(for source: URL) -> String {
-        if source.standardizedFileURL == draftSource?.standardizedFileURL {
+        let standardized = source.standardizedFileURL
+        if standardized == draftSource?.standardizedFileURL {
             return TransferPreflight.validFolderName(draftName)
         }
-        let position = draftSources.firstIndex {
-            $0.standardizedFileURL == source.standardizedFileURL
-        } ?? 0
+        let reels = draftSourceReels
+        guard let index = draftSources.firstIndex(where: { $0.standardizedFileURL == standardized }),
+              reels.indices.contains(index)
+        else { return "" }
         return TransferPreflight.validFolderName(
-            TransferPreflight.defaultFolderName(
-                reel: TransferPreflight.reelName(for: source, position: position)
-            )
+            TransferPreflight.defaultFolderName(reel: reels[index], at: draftFolderDate)
         )
     }
 
@@ -616,6 +795,156 @@ final class AppModel {
         guard draftDestinationLayout == .newFolder else { return true }
         let names = draftSources.map { draftFolderName(for: $0) }
         return !names.contains(where: \.isEmpty) && Set(names).count == names.count
+    }
+
+    /// The reel each draft source is named after, in `draftSources` order.
+    ///
+    /// The primary uses `draftReelName`. Another card that carries a
+    /// conventional reel in its own name (`A003`, `CANON_C012_01`) keeps it.
+    /// Every other card continues the primary's run — same letters, next tape
+    /// number — skipping any reel another source already has. A camera that
+    /// suggested `B004` is followed by `B005`, not the A camera's `A002`, and
+    /// an unnamed card never defaults onto a reel the batch already uses.
+    private var draftSourceReels: [String] {
+        guard draftSource != nil else { return [] }
+        let primary = draftReelName.uppercased()
+        let carried = draftAdditionalSources.map {
+            TransferPreflight.conventionalReel(in: $0.lastPathComponent)
+        }
+        var claimed = Set([primary] + carried.compactMap { $0 })
+        // A free-form primary reel has no run to continue; fall back to the
+        // A camera from A001, which is what a batch defaulted to before.
+        var run = Self.tapeRun(primary) ?? (prefix: "A", number: 1, width: 3)
+        var reels = [primary]
+        for reel in carried {
+            if let reel {
+                reels.append(reel)
+                continue
+            }
+            var candidate: String
+            repeat {
+                run.number += 1
+                candidate = Self.tapeName(prefix: run.prefix, number: run.number, width: run.width)
+            } while claimed.contains(candidate)
+            claimed.insert(candidate)
+            reels.append(candidate)
+        }
+        return reels
+    }
+
+    /// A reel read as a running tape: "B004" → ("B", 4, 3). One or two
+    /// letters then digits, as `CameraRecord` names them; anything else is a
+    /// free-form name with no next tape.
+    private static func tapeRun(_ reel: String) -> (prefix: String, number: Int, width: Int)? {
+        let prefix = reel.prefix { $0.isASCII && $0.isLetter }
+        let digits = reel.dropFirst(prefix.count)
+        guard (1...2).contains(prefix.count),
+              (1...6).contains(digits.count),
+              digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let number = Int(digits)
+        else { return nil }
+        return (String(prefix), number, digits.count)
+    }
+
+    private static func tapeName(prefix: String, number: Int, width: Int) -> String {
+        let digits = String(number)
+        return prefix + String(repeating: "0", count: max(0, width - digits.count)) + digits
+    }
+
+    /// The reel recorded in the catalog for one source's task: the reel its
+    /// own folder is named after, never the primary card's reel stamped on the
+    /// whole batch. As for a single source, nothing is recorded unless the
+    /// operator named the reel; the primary keeps exactly what was entered.
+    func draftCatalogReel(for source: URL) -> String {
+        guard !draftCardLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
+        let standardized = source.standardizedFileURL
+        if standardized == draftSource?.standardizedFileURL { return draftCardLabel }
+        let reels = draftSourceReels
+        guard let index = draftSources.firstIndex(where: { $0.standardizedFileURL == standardized }),
+              reels.indices.contains(index)
+        else { return "" }
+        return reels[index]
+    }
+
+    /// The folder name two sources in the batch would share, so the review can
+    /// say which; `nil` when every name is distinct or no folder is created.
+    var draftFolderNameCollision: String? {
+        guard draftDestinationLayout == .newFolder else { return nil }
+        var seen = Set<String>()
+        for source in draftSources {
+            let name = draftFolderName(for: source)
+            if !name.isEmpty, !seen.insert(name).inserted { return name }
+        }
+        return nil
+    }
+
+    /// The relative paths that two or more sources in a reviewed
+    /// Directly-in-destination batch would write into one destination, sorted;
+    /// empty when none do. A New-folder plan gives its source a folder of its
+    /// own, which `draftFolderNamesAreUnique` keeps distinct, so only direct
+    /// plans are compared.
+    ///
+    /// Destinations are grouped by canonical base, so one folder named two
+    /// ways is still one destination. Paths are compared as that destination
+    /// resolves names: case-folded unless its volume is known to be
+    /// case-sensitive, and, as Swift strings, with canonically equivalent
+    /// Unicode spellings equal. A shared path is named as the first source in
+    /// the batch spells it.
+    nonisolated static func directLayoutSharedPaths(in preflights: [TransferPreflight]) -> [String] {
+        let direct = preflights.filter { $0.layout == .directly }
+        func canonicalBase(_ destination: TransferPreflight.Destination) -> String {
+            destination.base.standardizedFileURL.resolvingSymlinksInPath().path
+        }
+        // Fold case unless every plan saw the base on a case-sensitive volume.
+        var foldsCase: [String: Bool] = [:]
+        for destination in direct.flatMap(\.destinations) {
+            let base = canonicalBase(destination)
+            let caseSensitive = destination.volume?.supportsCaseSensitiveNames == true
+            foldsCase[base] = (foldsCase[base] ?? false) || !caseSensitive
+        }
+        let posix = Locale(identifier: "en_US_POSIX")
+        // base → landing key → the first source that writes it.
+        var claims: [String: [String: (owner: Int, relativePath: String)]] = [:]
+        var shared = Set<String>()
+        for (owner, preflight) in direct.enumerated() {
+            for base in Set(preflight.destinations.map(canonicalBase)) {
+                let foldingCase = foldsCase[base] ?? true
+                for item in preflight.items {
+                    let key = foldingCase
+                        ? item.relativePath.folding(options: [.caseInsensitive], locale: posix)
+                        : item.relativePath
+                    if let claim = claims[base]?[key] {
+                        if claim.owner != owner { shared.insert(claim.relativePath) }
+                    } else {
+                        claims[base, default: [:]][key] = (owner, item.relativePath)
+                    }
+                }
+            }
+        }
+        return shared.sorted()
+    }
+
+    /// Why a reviewed Directly-in-destination batch cannot start, naming up to
+    /// three paths its sources share, or `nil` when no two sources share one.
+    /// The engine never overwrites, so a shared path would fail one source's
+    /// copy mid-offload; the New folder layout gives each source its own.
+    nonisolated static func directLayoutCollisionMessage(for preflights: [TransferPreflight]) -> String? {
+        let shared = directLayoutSharedPaths(in: preflights)
+        guard !shared.isEmpty else { return nil }
+        return L10n.format(
+            "Sources in this batch would write the same files into one destination: %@. Choose New folder under Output so each source gets its own folder.",
+            shared.prefix(3).joined(separator: ", ")
+        )
+    }
+
+    /// A reviewed plan still writes into the folder the draft names for its
+    /// source right now. A Reel Name typed or a camera picked while preflight
+    /// scanned fails this. Names are compared the way
+    /// `TransferPreflight.matches` compares them.
+    func reviewedFolderNameIsCurrent(_ preflight: TransferPreflight) -> Bool {
+        let current = draftFolderName(for: preflight.source)
+        return !current.isEmpty
+            && preflight.folderName == TransferPreflight.validFolderName(current)
     }
 
 
@@ -717,6 +1046,24 @@ final class AppModel {
                 return
             }
         }
+        // Sources written directly into a destination land side by side. Two
+        // cards that both hold DCIM/100/C0001.MP4 would collide there, and the
+        // second copy would fail mid-offload: refuse the batch up front.
+        if let collision = Self.directLayoutCollisionMessage(for: preflights) {
+            productStore.reportError(collision)
+            return
+        }
+        // Each task must still write into the folder the draft names for it.
+        // A Reel Name typed or a camera picked while preflight scanned renames
+        // it, and the reviewed plan then describes a folder the operator no
+        // longer sees: refuse before any session or journal exists.
+        if let stale = preflights.first(where: { !reviewedFolderNameIsCurrent($0) }) {
+            productStore.reportError(L10n.format(
+                "The folder name for %@ changed after preflight. Run preflight again.",
+                stale.source.lastPathComponent
+            ))
+            return
+        }
 
         let attributedProfile = draftOperatorProfile
         for preflight in preflights {
@@ -760,7 +1107,8 @@ final class AppModel {
                     projectID: selectedProjectID,
                     shootingDay: draftShootingDay,
                     cameraLabel: draftCameraLabel,
-                    cardLabel: draftCardLabel
+                    // Each task's own reel — the one its folder is named after.
+                    cardLabel: draftCatalogReel(for: preflight.source)
                 )
             }
             session.showLog = autoShowLog
@@ -792,12 +1140,25 @@ final class AppModel {
     }
 
     func resume(_ pausedSession: TransferSession) {
-        guard pausedSession.report?.status == .paused,
-              let manifestURL = pausedSession.manifestURL,
-              let data = try? Data(contentsOf: manifestURL),
-              let manifest = try? ManifestWriter.decode(data)
-        else {
-            productStore.reportError(L10n.text("The paused attempt's manifest is unavailable; it cannot be resumed safely."))
+        // A paused attempt is resumed once. A second resume would run after
+        // the first and collide with every file the first one published.
+        if let refusal = continuationRefusal(continuation(of: pausedSession.id)) {
+            productStore.reportError(refusal)
+            return
+        }
+        let manifest: TransferManifest
+        do {
+            manifest = try resumeManifest(for: pausedSession)
+        } catch {
+            productStore.reportError(error.localizedDescription)
+            return
+        }
+        guard let scope = Self.resumeScope(
+            pausedScope: pausedSession.includedRelativePaths,
+            pausedFingerprint: pausedSession.sourceFingerprint,
+            manifest: manifest
+        ) else {
+            productStore.reportError(L10n.text("The paused attempt's reviewed file scope cannot be confirmed; it cannot be resumed safely."))
             return
         }
         let session = TransferSession(
@@ -813,10 +1174,14 @@ final class AppModel {
             verificationProfile: pausedSession.verificationProfile,
             operatorProfile: productStore.activeProfile,
             projectID: pausedSession.projectID,
-            sourceFingerprint: manifest.sourceFingerprint ?? pausedSession.sourceFingerprint,
+            sourceFingerprint: scope.sourceFingerprint,
             allowSameVolume: pausedSession.allowSameVolume,
-            resumeManifest: manifest
+            resumeManifest: manifest,
+            // Exactly the paused attempt's reviewed items: a selection resumes
+            // the selection, never the folder around it.
+            includedRelativePaths: scope.includedRelativePaths
         )
+        continuations.claim(session.destinations, of: pausedSession.id, by: session.id)
         session.showLog = UserDefaults.standard.bool(forKey: "prefs.autoShowLog")
         configureCallbacks(for: session)
         if let index = sessions.firstIndex(where: { $0.id == pausedSession.id }) {
@@ -827,6 +1192,118 @@ final class AppModel {
         notifier.prepare()
         scheduleQueued()
         refreshDock()
+    }
+
+    /// The paused record a Resume builds on. Only this attempt's own paused
+    /// manifest qualifies, and only while its source is present and every
+    /// destination it paused on still holds that same record. A drive mounted
+    /// at the same path is not proof of identity, and a resume trusts the
+    /// files that drive already verified.
+    func resumeManifest(for pausedSession: TransferSession) throws -> TransferManifest {
+        guard pausedSession.report?.status == .paused,
+              let manifestURL = pausedSession.manifestURL,
+              let data = try? Data(contentsOf: manifestURL),
+              let manifest = try? ManifestWriter.decode(data),
+              manifest.transferID == pausedSession.id.uuidString.lowercased(),
+              manifest.status == TransferStatus.paused.rawValue
+        else {
+            throw ResumeRefusal(message: L10n.text("The paused attempt's manifest is unavailable; it cannot be resumed safely."))
+        }
+        guard FileManager.default.fileExists(atPath: pausedSession.source.path) else {
+            throw ResumeRefusal(message: L10n.format(
+                "Connect the source %@ to resume this transfer.",
+                pausedSession.source.lastPathComponent
+            ))
+        }
+        let recordName = ManifestWriter.manifestFileName(shortID: pausedSession.shortID)
+        for destination in pausedSession.destinations {
+            let record = (try? Data(contentsOf: destination.appendingPathComponent(recordName)))
+                .flatMap { try? ManifestWriter.decode($0) }
+            guard record?.transferID == manifest.transferID, record?.status == manifest.status else {
+                throw ResumeRefusal(message: L10n.format(
+                    "Resume needs every destination this transfer paused on. Reconnect %@, or use Retry as New Offload.",
+                    pausedSession.baseDestination(for: destination).lastPathComponent
+                ))
+            }
+        }
+        return manifest
+    }
+
+    /// What a resume of a paused attempt may transfer: exactly the paused
+    /// attempt's reviewed items, under the fingerprint the engine compared at
+    /// pause time. `nil` when that cannot be proven; the resume is refused.
+    ///
+    /// A whole-source attempt stays whole-source. The engine re-enumerates the
+    /// card and its fingerprint gate refuses any change, including a clip shot
+    /// during the pause. Narrowing it to the paused item list would leave such
+    /// a clip behind under a Verified verdict.
+    nonisolated static func resumeScope(
+        pausedScope: Set<String>?,
+        pausedFingerprint: String?,
+        manifest: TransferManifest
+    ) -> ResumeScope? {
+        // The session and its own evidence must agree on the reviewed plan.
+        if let recorded = manifest.sourceFingerprint, let pausedFingerprint,
+           recorded != pausedFingerprint {
+            return nil
+        }
+        // Without the plan's identity nothing could refuse a widened plan.
+        guard let fingerprint = manifest.sourceFingerprint ?? pausedFingerprint else { return nil }
+        guard let pausedScope else {
+            return ResumeScope(includedRelativePaths: nil, sourceFingerprint: fingerprint)
+        }
+        // A paused manifest lists every planned item, attempted or not, so it
+        // must be exactly the selection.
+        guard !pausedScope.isEmpty,
+              Set(manifest.items.map(\.relativePath)) == pausedScope
+        else { return nil }
+        return ResumeScope(includedRelativePaths: pausedScope, sourceFingerprint: fingerprint)
+    }
+
+    // MARK: - Linked attempts
+
+    func continuation(of attemptID: UUID) -> ContinuationAvailability {
+        continuations.availability(of: attemptID)
+    }
+
+    /// Failed pairs a repair could still claim from this attempt's card.
+    func retryableFailedPairCount(for session: TransferSession) -> Int {
+        guard let report = session.report else { return 0 }
+        return Self.retryableFailedPairCount(
+            in: report, destinations: session.destinations,
+            availability: continuation(of: session.id)
+        )
+    }
+
+    nonisolated static func retryableFailedPairCount(
+        in report: TransferReport, destinations: [URL], availability: ContinuationAvailability
+    ) -> Int {
+        repairableDestinations(destinations, availability: availability)
+            .reduce(0) { $0 + failedRelativePaths(in: report, at: $1).count }
+    }
+
+    /// Destinations a repair may still be created for: those no linked
+    /// attempt has taken over.
+    nonisolated static func repairableDestinations(
+        _ destinations: [URL], availability: ContinuationAvailability
+    ) -> [URL] {
+        switch availability {
+        case .open: destinations
+        case .continued(let claimed): destinations.filter { !claimed.contains($0) }
+        }
+    }
+
+    nonisolated static func failedRelativePaths(in report: TransferReport, at destination: URL) -> Set<String> {
+        Set(report.items.compactMap { item -> String? in
+            if case .failed = item.outcomes[destination] { return item.item.relativePath }
+            return nil
+        })
+    }
+
+    /// Why no resume or repair may be created from this card, or `nil`.
+    private func continuationRefusal(_ availability: ContinuationAvailability) -> String? {
+        guard case .continued = availability else { return nil }
+        return L10n.text("A linked attempt already continues this one. Use that attempt's card instead.")
     }
 
     private func configureCallbacks(for session: TransferSession) {
@@ -851,6 +1328,9 @@ final class AppModel {
                     report: report,
                     verificationProfile: session.verificationProfile
                 )
+                // A resume or repair the engine stopped before any destination
+                // hands its parent's Resume or Retry back.
+                self.continuations.settle(child: session.id, with: report)
                 self.notifier.notify(about: report, sourceName: session.displayName)
                 if report.status == .verified,
                    UserDefaults.standard.bool(forKey: Self.automaticContactSheetKey) {
