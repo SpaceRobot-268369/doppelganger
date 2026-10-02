@@ -13,7 +13,7 @@ struct TransferCardView: View {
     @State private var isEjecting = false
     @State private var ejectMessage: String?
 
-    private static let tileHeight: CGFloat = 76
+    private static let tileHeight: CGFloat = 100
     private static let tileSpacing: CGFloat = 10
 
     var body: some View {
@@ -65,10 +65,12 @@ struct TransferCardView: View {
             }
             .font(.caption)
             if session.isActive {
-                ProgressView(value: session.overallFraction)
-                    .progressViewStyle(.linear)
-                    .controlSize(.small)
-                    .tint(session.progress.phase == .verifying ? .cyan : .blue)
+                PixelProgressStrip(
+                    fraction: session.overallFraction,
+                    cell: session.progress.phase == .verifying ? .readBack : .copied,
+                    live: session.pixelPass != nil,
+                    lastAdvance: session.pixelLastAdvance
+                )
             }
         }
     }
@@ -184,10 +186,11 @@ struct TransferCardView: View {
                 .frame(width: 264)
             ConnectorView(
                 states: session.destinations.map(badgeState(for:)),
+                flows: session.pixelFlows(),
                 tileHeight: Self.tileHeight,
                 tileSpacing: Self.tileSpacing
             )
-            .frame(width: 56, height: destinationStackHeight)
+            .frame(width: 72, height: destinationStackHeight)
             VStack(spacing: Self.tileSpacing) {
                 ForEach(session.destinations, id: \.self) { destination in
                     destinationTile(destination)
@@ -276,7 +279,28 @@ struct TransferCardView: View {
     private func destinationTile(_ destination: URL) -> some View {
         let state = session.destinationState(destination)
         let errors = session.destinationErrorCount(destination)
-        return HStack(spacing: 12) {
+        // The header centres in the space above the mosaic, which stays pinned
+        // to the tile's bottom edge however the caption wraps.
+        return VStack(alignment: .leading, spacing: 0) {
+            destinationTileHeader(destination, state: state, errors: errors)
+                .frame(maxHeight: .infinity)
+            PixelMosaicView(snapshot: session.pixelMosaic(for: destination))
+                .padding(.bottom, 12)
+        }
+        .padding(.horizontal, 14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .background(
+            state == .failed ? Color.red.opacity(0.12) : Color.primary.opacity(0.045),
+            in: RoundedRectangle(cornerRadius: 14)
+        )
+    }
+
+    private func destinationTileHeader(
+        _ destination: URL,
+        state: TransferSession.DestinationState,
+        errors: Int
+    ) -> some View {
+        HStack(spacing: 12) {
             Image(systemName: "externaldrive.fill")
                 .font(.title3)
                 .foregroundStyle(state == .failed ? AnyShapeStyle(.red) : AnyShapeStyle(.tint))
@@ -297,14 +321,9 @@ struct TransferCardView: View {
             .help(destination.path)
             Spacer(minLength: 8)
             openFolderButton(destination, label: "Open destination output in Finder")
-            trailingIndicator(state, for: destination)
+            trailingIndicator(state)
+                .frame(width: 26, height: 26)
         }
-        .padding(.horizontal, 14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            state == .failed ? Color.red.opacity(0.12) : Color.primary.opacity(0.045),
-            in: RoundedRectangle(cornerRadius: 14)
-        )
     }
 
     private func destinationCaption(_ destination: URL) -> String {
@@ -332,8 +351,10 @@ struct TransferCardView: View {
         }
     }
 
+    /// Terminal states get a symbol; while a pass is live the tile's pixel
+    /// mosaic is the progress indicator, so the slot stays reserved and empty.
     @ViewBuilder
-    private func trailingIndicator(_ state: TransferSession.DestinationState, for destination: URL) -> some View {
+    private func trailingIndicator(_ state: TransferSession.DestinationState) -> some View {
         switch state {
         case .verified:
             Image(systemName: "checkmark.circle")
@@ -352,12 +373,7 @@ struct TransferCardView: View {
                 .font(.title2)
                 .foregroundStyle(.red)
         case .pending, .copying, .verifying:
-            ProgressRing(
-                fraction: session.destinationFraction(destination),
-                color: session.destinationErrorCount(destination) > 0
-                    ? .red : state == .verifying ? .cyan : .blue
-            )
-            .frame(width: 26, height: 26)
+            Color.clear
         }
     }
 
@@ -705,30 +721,14 @@ struct ActivityBars: View {
     }
 }
 
-// MARK: - Progress ring
-
-struct ProgressRing: View {
-    let fraction: Double
-    let color: Color
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .stroke(.secondary.opacity(0.25), lineWidth: 3)
-            Circle()
-                .trim(from: 0, to: max(fraction, 0.02))
-                .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-        }
-        .animation(.linear(duration: 0.2), value: fraction)
-    }
-}
-
 // MARK: - Connector lines
 
-/// Draws the curves from the source chip to each destination tile, with a
-/// status badge riding each curve — green check while clean, red cross the
-/// moment that destination has a failure.
+/// Draws the curves from the source chip to each destination tile. While a
+/// pass is moving bytes through a destination, pixel packets travel its curve:
+/// blue outbound while copying, cyan back toward the source while the copy is
+/// read back to verify. A destination whose bytes stopped moving shows no
+/// traffic. A status badge rides each curve whenever there is no traffic to
+/// show, and a red cross stays up the moment that destination has a failure.
 struct ConnectorView: View {
     enum BadgeState: Equatable {
         case pending
@@ -740,49 +740,114 @@ struct ConnectorView: View {
     }
 
     let states: [BadgeState]
+    var flows: [PixelFlow] = []
     let tileHeight: CGFloat
     let tileSpacing: CGFloat
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var clock = PixelStreamClock()
+
+    /// Packets snap to this grid so they read as pixels rather than dots.
+    private static let pixelGrid: CGFloat = 3
+
     var body: some View {
-        Canvas { context, size in
-            let start = CGPoint(x: 0, y: size.height / 2)
-            for (index, state) in states.enumerated() {
-                let end = CGPoint(x: size.width, y: centerY(index))
-                var path = Path()
-                path.move(to: start)
-                path.addCurve(
-                    to: end,
-                    control1: CGPoint(x: size.width * 0.55, y: start.y),
-                    control2: CGPoint(x: size.width * 0.45, y: end.y)
-                )
-                context.stroke(
-                    path,
-                    with: .color(lineColor(state)),
-                    style: StrokeStyle(lineWidth: 1.5)
-                )
-                drawBadge(context, state: state, at: midpoint(start: start, end: end, size: size))
+        let streaming = !reduceMotion && flows.contains { $0.pass != nil }
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !streaming)) { timeline in
+            Canvas { context, size in
+                let date = timeline.date
+                let start = CGPoint(x: 0, y: size.height / 2)
+                for (index, state) in states.enumerated() {
+                    let end = CGPoint(x: size.width, y: centerY(index))
+                    let flow = flows.indices.contains(index) ? flows[index] : .idle
+                    let moving = flow.isMoving(at: date)
+                    var path = Path()
+                    path.move(to: start)
+                    path.addCurve(
+                        to: end,
+                        control1: CGPoint(x: size.width * 0.55, y: start.y),
+                        control2: CGPoint(x: size.width * 0.45, y: end.y)
+                    )
+                    context.stroke(
+                        path,
+                        with: .color(lineColor(state, streaming: moving)),
+                        style: StrokeStyle(lineWidth: 1.5)
+                    )
+                    if moving {
+                        drawPackets(context, flow: flow, index: index, date: date,
+                                    start: start, end: end, size: size)
+                    }
+                    if !moving || state == .problem {
+                        drawBadge(context, state: state,
+                                  at: point(at: 0.5, start: start, end: end, size: size))
+                    }
+                }
             }
         }
+        .accessibilityHidden(true)
     }
 
     private func centerY(_ index: Int) -> CGFloat {
         CGFloat(index) * (tileHeight + tileSpacing) + tileHeight / 2
     }
 
-    /// Cubic Bézier point at t = 0.5 for the control points used above.
-    private func midpoint(start: CGPoint, end: CGPoint, size: CGSize) -> CGPoint {
+    /// Cubic Bézier point at `t` for the control points used above.
+    private func point(at t: Double, start: CGPoint, end: CGPoint, size: CGSize) -> CGPoint {
         let c1 = CGPoint(x: size.width * 0.55, y: start.y)
         let c2 = CGPoint(x: size.width * 0.45, y: end.y)
-        let x = (start.x + 3 * c1.x + 3 * c2.x + end.x) / 8
-        let y = (start.y + 3 * c1.y + 3 * c2.y + end.y) / 8
-        return CGPoint(x: x, y: y)
+        let t = CGFloat(t)
+        let u = 1 - t
+        let a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t
+        return CGPoint(
+            x: a * start.x + b * c1.x + c * c2.x + d * end.x,
+            y: a * start.y + b * c1.y + c * c2.y + d * end.y
+        )
     }
 
-    private func lineColor(_ state: BadgeState) -> Color {
+    private func drawPackets(
+        _ context: GraphicsContext,
+        flow: PixelFlow,
+        index: Int,
+        date: Date,
+        start: CGPoint,
+        end: CGPoint,
+        size: CGSize
+    ) {
+        let color: Color = flow.pass == .readBack ? .cyan : .blue
+        guard !reduceMotion else {
+            for t in flow.stillPositions {
+                context.fill(pixel(at: point(at: t, start: start, end: end, size: size), side: 4),
+                             with: .color(color))
+            }
+            return
+        }
+        // The trail sits behind each packet in its direction of travel.
+        let trail = flow.pass == .readBack ? 0.05 : -0.05
+        let phase = clock.phase(
+            for: index, speed: flow.speed, at: date.timeIntervalSinceReferenceDate)
+        for t in flow.packetPositions(phase: phase) {
+            let behind = t + trail
+            if (0...1).contains(behind) {
+                context.fill(pixel(at: point(at: behind, start: start, end: end, size: size), side: 3),
+                             with: .color(color.opacity(0.4)))
+            }
+            context.fill(pixel(at: point(at: t, start: start, end: end, size: size), side: 4),
+                         with: .color(color))
+        }
+    }
+
+    private func pixel(at point: CGPoint, side: CGFloat) -> Path {
+        let grid = Self.pixelGrid
+        let x = (point.x / grid).rounded() * grid
+        let y = (point.y / grid).rounded() * grid
+        return Path(CGRect(x: x - side / 2, y: y - side / 2, width: side, height: side))
+    }
+
+    /// Lines carrying traffic step back so the pixels read first.
+    private func lineColor(_ state: BadgeState, streaming: Bool) -> Color {
         switch state {
         case .pending: .secondary.opacity(0.3)
-        case .copying: .blue.opacity(0.55)
-        case .verifying: .cyan.opacity(0.6)
+        case .copying: .blue.opacity(streaming ? 0.3 : 0.55)
+        case .verifying: .cyan.opacity(streaming ? 0.35 : 0.6)
         case .pendingVerification: .yellow.opacity(0.7)
         case .verified: .green.opacity(0.55)
         case .problem: .red.opacity(0.6)
