@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import IOKit
 
 /// The production `FileSystemAccess`: real POSIX I/O against real paths.
 /// Everything that touches an actual disk lives here, behind Core's protocol,
@@ -159,7 +160,8 @@ public struct RealFileSystem: FileSystemAccess {
             isReadOnly: values.volumeIsReadOnly ?? false,
             supportsCaseSensitiveNames: values.volumeSupportsCaseSensitiveNames,
             maximumNameBytes: Self.pathLimit(existing.path, key: _PC_NAME_MAX),
-            maximumPathBytes: Self.pathLimit(existing.path, key: _PC_PATH_MAX)
+            maximumPathBytes: Self.pathLimit(existing.path, key: _PC_PATH_MAX),
+            physicalDeviceIdentifier: Self.physicalDeviceIdentifier(forPath: existing.path)
         )
     }
 
@@ -254,6 +256,12 @@ public struct RealFileSystem: FileSystemAccess {
                 || component == ".TemporaryItems"
                 || component.hasPrefix("._")
                 || component.hasPrefix(".doppelganger-partial-")
+                // A fine-grained retry sets the parent's failed bytes aside
+                // under `<output>/.doppelganger-failed/<parent>/` (TransferWorker).
+                // They are known-bad evidence, never media: a cascade must not
+                // copy them onward and Verify Existing must not count them as
+                // added files. Exact name only; look-alike hidden names stay media.
+                || component == ".doppelganger-failed"
                 || component.hasPrefix("doppelganger-manifest-")
                 || component.hasPrefix("doppelganger-report-")
                 || component.hasPrefix("doppelganger-transfer-")
@@ -264,5 +272,108 @@ public struct RealFileSystem: FileSystemAccess {
     private static func pathLimit(_ path: String, key: Int32) -> Int? {
         let value = pathconf(path, key)
         return value > 0 ? value : nil
+    }
+}
+
+// MARK: - Physical device identity
+
+extension RealFileSystem {
+    /// The failure domain behind the volume holding `path`, or `nil` when it
+    /// cannot be established. See `FileSystemVolume.physicalDeviceIdentifier`.
+    static func physicalDeviceIdentifier(forPath path: String) -> String? {
+        var stats = statfs()
+        guard statfs(path, &stats) == 0 else { return nil }
+        let mountedFrom = withUnsafeBytes(of: stats.f_mntfromname) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return physicalDeviceIdentifier(
+            isLocal: stats.f_flags & UInt32(MNT_LOCAL) != 0,
+            mountedFrom: mountedFrom,
+            wholePhysicalDisk: wholePhysicalDisk(forBSDName:)
+        )
+    }
+
+    /// Pure classification of one mount, testable without hardware. Local
+    /// mounts name a `/dev` node and resolve to their whole physical disk;
+    /// network mounts resolve to their server. Anything else is unknown.
+    static func physicalDeviceIdentifier(
+        isLocal: Bool,
+        mountedFrom: String,
+        wholePhysicalDisk: (String) -> String?
+    ) -> String? {
+        if isLocal {
+            guard mountedFrom.hasPrefix("/dev/") else { return nil }
+            return wholePhysicalDisk(String(mountedFrom.dropFirst("/dev/".count))).map { "disk:" + $0 }
+        }
+        return networkServer(mountedFrom: mountedFrom).map { "net:" + $0 }
+    }
+
+    /// The server of a network mount source, lowercased, without user name
+    /// or port: `//user@NAS.local/Share` (smbfs, afpfs), `nas:/export`
+    /// (nfs), `https://dav.example.com/x` (webdav). Never returns the user.
+    static func networkServer(mountedFrom source: String) -> String? {
+        var rest = Substring(source)
+        if rest.hasPrefix("//") {
+            rest = rest.dropFirst(2)
+        } else if let scheme = rest.range(of: "://") {
+            rest = rest[scheme.upperBound...]
+        } else if let colon = rest.firstIndex(of: ":") {
+            rest = rest[..<colon]
+        } else {
+            return nil
+        }
+        var host = String(rest.prefix { $0 != "/" })
+        if let at = host.lastIndex(of: "@") { host = String(host[host.index(after: at)...]) }
+        if host.hasPrefix("["), let close = host.firstIndex(of: "]") {
+            host = String(host[...close])              // IPv6 literal
+        } else if let colon = host.firstIndex(of: ":") {
+            host = String(host[..<colon])              // port
+        }
+        host = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        return host.isEmpty ? nil : host
+    }
+
+    /// The outermost whole-disk IOMedia above `bsdName` — for an APFS volume
+    /// the disk holding its container's physical store, for a partition its
+    /// disk — as `<bsd>@<registry entry ID>`, so a BSD name reused after a
+    /// re-attach never aliases. `nil` for disk images and other virtual
+    /// devices, whose real backing store IOKit cannot name.
+    static func wholePhysicalDisk(forBSDName bsdName: String) -> String? {
+        guard let matching = IOBSDNameMatching(kIOMainPortDefault, 0, bsdName) else { return nil }
+        var entry = IOServiceGetMatchingService(kIOMainPortDefault, matching) // consumes `matching`
+        guard entry != IO_OBJECT_NULL else { return nil }
+        var outermost: String?
+        var virtualAboveOutermost = false
+        while true {
+            if IOObjectConformsTo(entry, "IOMedia") != 0,
+               registryProperty(entry, "Whole") as? Bool == true,
+               let name = registryProperty(entry, "BSD Name") as? String {
+                var entryID: UInt64 = 0
+                _ = IORegistryEntryGetRegistryEntryID(entry, &entryID)
+                outermost = "\(name)@\(entryID)"
+                // Only what sits above the physical disk decides virtuality;
+                // APFS layers below it are irrelevant.
+                virtualAboveOutermost = false
+            } else if IOObjectConformsTo(entry, "AppleDiskImageDevice") != 0
+                        || IOObjectConformsTo(entry, "IOHDIXHDDrive") != 0
+                        || isVirtualInterconnect(entry) {
+                virtualAboveOutermost = true
+            }
+            var parent: io_registry_entry_t = IO_OBJECT_NULL
+            let status = IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent)
+            IOObjectRelease(entry)
+            guard status == KERN_SUCCESS else { break }
+            entry = parent
+        }
+        return virtualAboveOutermost ? nil : outermost
+    }
+
+    private static func registryProperty(_ entry: io_registry_entry_t, _ key: String) -> Any? {
+        IORegistryEntryCreateCFProperty(entry, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+    }
+
+    private static func isVirtualInterconnect(_ entry: io_registry_entry_t) -> Bool {
+        let characteristics = registryProperty(entry, "Protocol Characteristics") as? [String: Any]
+        return characteristics?["Physical Interconnect"] as? String == "Virtual Interface"
     }
 }

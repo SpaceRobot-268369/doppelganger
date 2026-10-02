@@ -14,6 +14,15 @@ public struct FileSystemVolume: Sendable, Hashable, Codable {
     public let supportsCaseSensitiveNames: Bool?
     public let maximumNameBytes: Int?
     public let maximumPathBytes: Int?
+    /// The physical failure domain behind this volume, used only to decide
+    /// whether copies are independent: `disk:<bsd>@<registry id>` for the
+    /// whole physical disk an APFS container or partition lives on, or
+    /// `net:<server>` for a network share. Volumes with different
+    /// `identifier`s can share it — two APFS volumes or partitions on one
+    /// disk, two shares from one server. `nil` when the platform could not
+    /// establish it; independence checks then treat the volume as unproven,
+    /// never as independent. Valid for this boot only; never persist it.
+    public let physicalDeviceIdentifier: String?
 
     public init(
         identifier: String,
@@ -26,7 +35,8 @@ public struct FileSystemVolume: Sendable, Hashable, Codable {
         isReadOnly: Bool = false,
         supportsCaseSensitiveNames: Bool? = nil,
         maximumNameBytes: Int? = nil,
-        maximumPathBytes: Int? = nil
+        maximumPathBytes: Int? = nil,
+        physicalDeviceIdentifier: String? = nil
     ) {
         self.identifier = identifier
         self.name = name
@@ -39,6 +49,7 @@ public struct FileSystemVolume: Sendable, Hashable, Codable {
         self.supportsCaseSensitiveNames = supportsCaseSensitiveNames
         self.maximumNameBytes = maximumNameBytes
         self.maximumPathBytes = maximumPathBytes
+        self.physicalDeviceIdentifier = physicalDeviceIdentifier
     }
 }
 

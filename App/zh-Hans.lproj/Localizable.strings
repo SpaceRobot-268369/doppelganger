@@ -159,6 +159,12 @@
 "Preflight has warnings" = "预检有警告";
 "Preflight needs attention" = "预检需要处理";
 "I understand these copies are not on independent volumes." = "我明白这些副本并不位于彼此独立的宗卷上。";
+"A camera-card source cannot also be its own destination volume." = "摄影机卡来源不能同时作为自身的目的地宗卷。";
+"A camera-card source cannot share its physical device with a destination." = "摄影机卡来源不能与目的地位于同一物理设备上。";
+"%@ is on the same volume as the source; this is not an independent backup." = "%@ 与来源位于同一宗卷上；这不是独立备份。";
+"%@ is on the same physical device as the source; this is not an independent backup." = "%@ 与来源位于同一物理设备上；这不是独立备份。";
+"%@ share one physical volume; they are not independent copies." = "%@ 共用同一物理宗卷；它们不是彼此独立的副本。";
+"Could not identify the physical device behind %@; the copies cannot be confirmed as independent." = "无法识别 %@ 所在的物理设备；无法确认这些副本彼此独立。";
 "Source contents" = "来源内容";
 "Media analysis" = "媒体分析";
 "Previously seen" = "曾经见过";
