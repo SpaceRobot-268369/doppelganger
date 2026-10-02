@@ -6,10 +6,11 @@ struct SidebarView: View {
     var body: some View {
         List(selection: sectionSelection) {
             Section {
-                ForEach(SidebarSection.allCases.filter { $0 != .preferences }) { section in
+                // Settings lives in the footer; Compare is not yet a shipped
+                // feature and stays out of the top-level list until it is.
+                ForEach(SidebarSection.allCases.filter { $0 != .preferences && $0 != .compare }) { section in
                     Label(section.title, systemImage: section.icon)
-                        .badge(section == .transfers && !model.sessions.isEmpty
-                            ? model.activeCount + model.attentionCount : 0)
+                        .badge(section == .transfers ? transfersBadgeCount : 0)
                         .tag(section)
                 }
             } header: {
@@ -20,6 +21,12 @@ struct SidebarView: View {
         .safeAreaInset(edge: .bottom) {
             footer
         }
+    }
+
+    /// Every session that is still working or needs attention, counted once
+    /// even when a running transfer already has a live failure.
+    private var transfersBadgeCount: Int {
+        model.sessions.filter { $0.isActive || $0.needsAttention }.count
     }
 
     /// While a secondary page is open the sidebar shows no selection, so any
@@ -107,7 +114,9 @@ struct SidebarView: View {
             }
             .padding(.horizontal, 10)
             .padding(.bottom, 6)
-            .help(model.systemNominal ? "No current transfer has reported a problem" : "A transfer did not verify")
+            .help(model.systemNominal
+                ? "No current transfer has reported a problem"
+                : "A transfer failed, was cancelled, or still needs verification")
             SidebarFooterRow(
                 title: SidebarSection.preferences.title,
                 icon: SidebarSection.preferences.icon,

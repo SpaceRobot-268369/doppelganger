@@ -2,6 +2,7 @@
 "Transfers" = "传输";
 "Sources" = "来源";
 "Destinations" = "目的地";
+"Storage" = "存储";
 "Projects" = "项目";
 "Manifests" = "清单";
 "Compare" = "比对";
@@ -310,6 +311,8 @@
 "Paused · completed files retained" = "已暂停 · 已完成文件已保留";
 "Verified · %@" = "已验证 · %@";
 "Failed · %@" = "失败 · %@";
+"Copies verified · transfer not verified" = "副本已验证 · 传输未验证";
+"Transferred · transfer not verified" = "已传输 · 传输未验证";
 "Choose a source to offload." = "请选择要传输的来源。";
 "Source %@ is not mounted." = "来源 %@ 未挂载。";
 "The same source is listed twice." = "同一来源被重复添加。";
@@ -383,3 +386,50 @@
 "verification pending" = "等待验证";
 "failed" = "失败";
 "skipped" = "已跳过";
+
+/* Transfer card headline and phase text (TransferSession.headline) */
+"Queued · waiting for a slot" = "排队中 · 等待空闲槽位";
+"Paused safely · Resume available" = "已安全暂停 · 可以继续";
+"Paused · continued in a linked attempt" = "已暂停 · 已由关联尝试接续";
+"Verified · Complete" = "已验证 · 完成";
+"Interrupted · Review required" = "已中断 · 需要检查";
+"Failed · 1 copy result failed" = "失败 · 1 个复制结果失败";
+"Failed · %lld copy results failed" = "失败 · %lld 个复制结果失败";
+"Failed · transfer evidence incomplete" = "失败 · 传输证据不完整";
+"Cancelled · Incomplete" = "已取消 · 不完整";
+"Scanning source…" = "正在扫描来源…";
+"Maximum · reading source…" = "最高模式 · 正在读取来源…";
+"Copying · %lld%%" = "正在复制 · %lld%%";
+"Verifying · %lld%%" = "正在验证 · %lld%%";
+"Writing manifest…" = "正在写入清单…";
+"Finishing…" = "正在完成…";
+
+/* Transfer card captions and detail */
+"Started by %@" = "由 %@ 启动";
+"FILES" = "文件";
+"ID" = "编号";
+"bottleneck" = "瓶颈";
+"Transfer rate" = "传输速率";
+"ETA" = "预计剩余时间";
+"Pausing after the current file finishes · %@" = "当前文件完成后暂停 · %@";
+"Pausing after the current file finishes" = "当前文件完成后暂停";
+"%lld files × 1 destination — every copy passed checksum verification." = "%lld 个文件 × 1 个目的地——每个副本均通过校验和验证。";
+"1 failure" = "1 个失败";
+"%lld failures" = "%lld 个失败";
+"Transfer-level issue" = "传输级问题";
+"Transfer-level warning" = "传输级警告";
+
+/* Transfers dashboard */
+"1 transfer" = "1 个传输";
+"%lld transfers" = "%lld 个传输";
+"Dismiss" = "忽略";
+"Dismiss mount notice" = "忽略挂载提示";
+"No current issues" = "当前没有问题";
+"Attention needed" = "需要处理";
+"No current transfer has reported a problem" = "当前没有传输报告问题";
+"A transfer failed, was cancelled, or still needs verification" = "有传输失败、已取消或仍需验证";
+
+/* Preflight verdict */
+"%lld files · %@" = "%1$lld 个文件 · %2$@";
+"%lld recognized media · %lld sidecars" = "%1$lld 个已识别媒体 · %2$lld 个 sidecar";
+"This exact source plan was verified before · %@ → %@" = "此来源计划之前已验证通过 · %1$@ → %2$@";

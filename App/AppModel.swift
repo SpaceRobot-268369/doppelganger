@@ -267,16 +267,16 @@ final class AppModel {
         switch filter {
         case .all: sessions
         case .active: sessions.filter(\.isActive)
-        case .attention: sessions.filter { $0.report?.status != .verified && !$0.isActive }
+        case .attention: sessions.filter(\.needsAttention)
         case .verified: sessions.filter { $0.report?.status == .verified }
         }
     }
 
     var activeCount: Int { sessions.filter(\.isActive).count }
     var completeCount: Int { sessions.count - activeCount }
-    var attentionCount: Int {
-        sessions.filter { $0.report?.status != .verified && !$0.isActive }.count
-    }
+    /// Shares `TransferSession.needsAttention` with the filter chip and the
+    /// sidebar footer so the three never disagree about what is a problem.
+    var attentionCount: Int { sessions.filter(\.needsAttention).count }
     var verifiedCount: Int { sessions.filter { $0.report?.status == .verified }.count }
     var runningCount: Int { sessions.filter(\.isRunning).count }
 
@@ -339,10 +339,11 @@ final class AppModel {
     var totalPlannedBytes: Int64 { sessions.reduce(0) { $0 + $1.planTotalBytes } }
     var aggregateThroughput: Double { sessions.reduce(0) { $0 + $1.throughputBytesPerSecond } }
 
-    /// Quiet green only while nothing has failed; a failed or cancelled
-    /// transfer flips the footer to a loud warning until its card is dismissed.
+    /// Quiet only while no session needs attention — a live failure, a failed
+    /// or cancelled verdict, or a copy still awaiting verification flips the
+    /// footer to a loud warning until its card is dismissed or verified.
     var systemNominal: Bool {
-        !sessions.contains { $0.hasAttention }
+        !sessions.contains(where: \.needsAttention)
     }
 
     func remove(_ session: TransferSession) {

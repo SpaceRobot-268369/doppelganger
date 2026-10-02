@@ -25,8 +25,13 @@ struct TransfersView: View {
                 ScrollView {
                     LazyVStack(spacing: 14) {
                         ForEach(Array(model.filteredSessions.enumerated()), id: \.element.id) { index, session in
-                            TransferCardView(model: model, session: session, index: index + 1)
-                                .transition(.opacity.combined(with: .move(edge: .top)))
+                            TransferCardView(
+                                model: model,
+                                session: session,
+                                index: index + 1,
+                                isFirstRunning: session.id == firstRunningSessionID
+                            )
+                            .transition(.opacity.combined(with: .move(edge: .top)))
                         }
                     }
                     .padding(.horizontal, 24)
@@ -37,6 +42,12 @@ struct TransfersView: View {
             footer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    /// The task the dashboard auto-expands: the first *running* session in
+    /// creation order, independent of list position or the active filter.
+    private var firstRunningSessionID: UUID? {
+        model.sessions.first(where: \.isRunning)?.id
     }
 
     /// Starting a transfer must be reachable at any time, not only from the
@@ -84,17 +95,14 @@ struct TransfersView: View {
             }
             .buttonStyle(.glassProminent)
             .tint(.blue)
-            Button("Choose…") {
-                model.mountBanner = nil
-                model.beginOffload(source: volume.url)
-            }
-            .buttonStyle(.glass)
             Button {
                 model.mountBanner = nil
             } label: {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.glass)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss mount notice")
         }
         .padding(14)
         .glassEffect(.regular.tint(.blue.opacity(0.25)), in: .rect(cornerRadius: 14))
@@ -151,7 +159,7 @@ struct TransfersView: View {
 
     private var footer: some View {
         HStack {
-            Text("\(model.sessions.count) transfer\(model.sessions.count == 1 ? "" : "s")")
+            Text(transferCountText)
             Spacer()
             if model.totalPlannedBytes > 0 {
                 Text("Total: \(Format.bytes(model.totalPlannedBytes))")
@@ -167,5 +175,11 @@ struct TransfersView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 10)
         .background(.quinary)
+    }
+
+    private var transferCountText: String {
+        model.sessions.count == 1
+            ? L10n.text("1 transfer")
+            : L10n.format("%lld transfers", Int64(model.sessions.count))
     }
 }
