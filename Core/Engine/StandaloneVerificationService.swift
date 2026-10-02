@@ -61,8 +61,17 @@ enum StandaloneVerificationService {
             let startedAt = Date()
             let reference = try VerificationReference.load(from: referenceURL)
             let fileSystem = RealFileSystem()
+            // The chosen reference is the evidence this run checks against, not
+            // media: an MHL v1 sits in the root of the folder it describes. Only
+            // that one file is set aside, matched by the canonical relative path
+            // enumeration produces; any other unlisted file, another .mhl
+            // included, is still added. A reference outside the folder sets
+            // nothing aside.
+            let referenceInsideMedia = try? fileSystem
+                .sourceItem(at: referenceURL, relativeTo: mediaRoot)
+                .relativePath
             let actualItems = try fileSystem.enumerate(root: mediaRoot).filter {
-                !isGeneratedEvidence($0.relativePath)
+                !isGeneratedEvidence($0.relativePath) && $0.relativePath != referenceInsideMedia
             }
             let actualPaths = Set(actualItems.map(\.relativePath))
             let expectedPaths = Set(reference.entries.map(\.relativePath))

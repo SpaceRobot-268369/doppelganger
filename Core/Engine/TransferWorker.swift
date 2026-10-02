@@ -1027,6 +1027,7 @@ struct TransferWorker {
                     if let receipt = try MHLHistoryStore.append(
                         report: provisional,
                         destination: destination,
+                        carryingVerifiedPairsFrom: request.retryManifest,
                         fileSystem: fileSystem
                     ) {
                         receipts.append(receipt)
