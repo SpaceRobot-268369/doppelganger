@@ -48,7 +48,13 @@ public struct FileSystemVolume: Sendable, Hashable, Codable {
 public protocol FileSystemAccess: Sendable {
     /// Recursively list regular files under `root`, relative paths preserved,
     /// in a deterministic sorted order. Must never mutate anything beneath
-    /// `root` — the source stays read-only, `.DS_Store` included.
+    /// `root` — the source stays read-only, `.DS_Store` included. Symbolic
+    /// links are not media and are not followed outside `root`. Never
+    /// returns a partial list: if any part of the tree outside known
+    /// operating-system metadata cannot be read, throw
+    /// `FileSystemError.notReadable` (or `.volumeGone` if the root itself
+    /// vanished). Preflight, the engine plan and the post-transfer rescan
+    /// treat the result as the complete source.
     func enumerate(root: URL) throws -> [SourceItem]
 
     /// Resolve aliases/symlinks for safety comparisons. For a not-yet-created

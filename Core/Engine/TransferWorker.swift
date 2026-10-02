@@ -74,6 +74,7 @@ struct TransferWorker {
             items = try fileSystem.enumerate(root: request.sourceRoot)
         } catch {
             sourceDead = true
+            transferIssues.append("The source could not be scanned: \(describe(error))")
             await hub.log(.error, "Could not enumerate source: \(describe(error))")
             await finish(writeToDestinations: true)
             return
@@ -390,11 +391,19 @@ struct TransferWorker {
             do {
                 try fileSystem.createDirectory(at: target.deletingLastPathComponent())
                 if fileSystem.fileExists(at: target) {
-                    guard try quarantineRetryTargetIfAuthorized(
-                        target,
-                        relativePath: item.relativePath,
-                        destination: destination
-                    ) else { throw FileSystemError.alreadyExists }
+                    switch try await resolveExistingRetryTarget(target, item: item, destination: destination) {
+                    case .quarantined:
+                        break
+                    case .provenDuplicate(let sourceDigest):
+                        // Proven identical to the source: kept in place, never
+                        // rewritten, and no writer is needed here.
+                        digests[item.relativePath] = sourceDigest
+                        await record(item.relativePath, destination, .verifiedDuplicate)
+                        await hub.log(.info, "Existing copy proven identical and kept: \(item.relativePath) at \(destination.path)")
+                        continue
+                    case .refused:
+                        throw FileSystemError.alreadyExists
+                    }
                 }
                 let stream = WriterStreamBox(try fileSystem.openForWritingExclusive(staging))
                 let channel = BoundedAsyncChannel<[UInt8]>(capacity: 2)
@@ -873,28 +882,68 @@ struct TransferWorker {
         return true
     }
 
-    /// Preserve the parent's failed bytes under a hidden quarantine tree.
-    /// Nothing is overwritten; evidence remains alongside both generations.
-    private func quarantineRetryTargetIfAuthorized(
+    /// What a fine-grained retry may do with a file already at its target.
+    private enum ExistingRetryTarget {
+        /// The parent's own failed bytes were set aside; publish a fresh copy.
+        case quarantined
+        /// The file there is proven to hold the source's bytes; keep it.
+        case provenDuplicate(sourceDigest: String)
+        /// Unproven: the pair fails as a collision and the file is untouched.
+        case refused
+    }
+
+    /// Decides what a retry does with an existing destination file. Nothing
+    /// is ever overwritten, and a file is moved only on proof:
+    ///
+    /// - The parent recorded a checksum mismatch for this path at this
+    ///   destination, with the digest it read back, and the file there still
+    ///   hashes to that digest: those are the parent's own failed bytes, so
+    ///   they are set aside under `.doppelganger-failed/<parent>/` (one slot
+    ///   per parent and path) and a fresh copy is published.
+    /// - The file there hashes to the parent's recorded source digest and the
+    ///   current source re-hashes to it too: the copy is already correct (the
+    ///   parent published it but never finished verifying it, or an earlier
+    ///   repair fixed it), so it is kept in place as a verified duplicate.
+    ///
+    /// Anything else, including a parent that never wrote the path (a name
+    /// collision, a whole-destination preflight failure, a skipped pair) or
+    /// bytes that match neither digest (another task's verified copy), is
+    /// refused: the pair fails as a collision and the file stays put.
+    private func resolveExistingRetryTarget(
         _ target: URL,
-        relativePath: String,
+        item: SourceItem,
         destination: URL
-    ) throws -> Bool {
+    ) async throws -> ExistingRetryTarget {
         guard let manifest = request.retryManifest,
-              let record = manifest.items.first(where: { $0.relativePath == relativePath }),
-              record.results.contains(where: {
-                  $0.destination == destination.path && $0.status != "verified"
-              })
-        else { return false }
-        let parentID = (manifest.attemptID ?? manifest.transferID).prefix(8).lowercased()
-        let quarantineRoot = destination
-            .appendingPathComponent(".doppelganger-failed", isDirectory: true)
-            .appendingPathComponent(parentID, isDirectory: true)
-        let quarantine = quarantineRoot.appendingPathComponent(relativePath)
-        try fileSystem.createDirectory(at: quarantine.deletingLastPathComponent())
-        guard !fileSystem.fileExists(at: quarantine) else { return false }
-        try fileSystem.moveItemExclusive(from: target, to: quarantine)
-        return true
+              let record = manifest.items.first(where: { $0.relativePath == item.relativePath }),
+              let parentResult = record.results.first(where: { $0.destination == destination.path })
+        else { return .refused }
+        // Identity before anything else, uncached like verification.
+        // Unreadable bytes are unproven.
+        guard let targetDigest = try? await hashFile(target, uncached: true) else { return .refused }
+
+        if parentResult.status == "failed",
+           parentResult.reason == ItemFailureReason.checksumMismatch(expected: "", actual: "").slug,
+           parentResult.actualDigest == targetDigest {
+            let parentID = (manifest.attemptID ?? manifest.transferID).prefix(8).lowercased()
+            let quarantine = destination
+                .appendingPathComponent(".doppelganger-failed", isDirectory: true)
+                .appendingPathComponent(parentID, isDirectory: true)
+                .appendingPathComponent(item.relativePath)
+            guard !fileSystem.fileExists(at: quarantine) else { return .refused }
+            try fileSystem.createDirectory(at: quarantine.deletingLastPathComponent())
+            try fileSystem.moveItemExclusive(from: target, to: quarantine)
+            return .quarantined
+        }
+
+        guard let priorDigest = record.digest, targetDigest == priorDigest, sourceStillMatches(item),
+              let sourceDigest = try? await hashFile(
+                  request.sourceRoot.appendingPathComponent(item.relativePath),
+                  uncached: true
+              ),
+              sourceDigest == priorDigest, sourceStillMatches(item)
+        else { return .refused }
+        return .provenDuplicate(sourceDigest: sourceDigest)
     }
 
     private mutating func confirmSourcePlanUnchanged() async {
