@@ -40,6 +40,9 @@ struct TransferWorker {
     /// zero items must not read as a vacuous success.
     private var vetoed = false
     private var transferIssues: [String] = []
+    /// Prefix of an advisory transfer issue: reported, but never a reason the
+    /// run is not verified. The catalog task rollup reads it as neutral.
+    static let warningIssuePrefix = "Warning: "
     /// Fix-up bookkeeping for destinations whose filesystem refused to
     /// preserve source timestamps: destination → (first issue index, count).
     private var timestampWarnings: [URL: (issueIndex: Int, count: Int)] = [:]
@@ -690,7 +693,7 @@ struct TransferWorker {
         await hub.log(.warning, "\(item.relativePath): could not preserve source timestamp at " +
             "\(destination.path) — \(describe(error)); bytes are published and will be verified")
         let count = (timestampWarnings[destination]?.count ?? 0) + 1
-        let message = "Warning: could not preserve source timestamps on \(count) file(s) at " +
+        let message = "\(Self.warningIssuePrefix)could not preserve source timestamps on \(count) file(s) at " +
             "\(destination.path); file contents are unaffected, but a later cascade from this destination " +
             "will see a different source-plan fingerprint."
         if let existing = timestampWarnings[destination] {

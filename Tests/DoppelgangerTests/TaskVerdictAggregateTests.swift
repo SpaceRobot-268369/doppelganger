@@ -96,6 +96,7 @@ struct TaskVerdictAggregateTests {
         destinations: [URL],
         profile: VerificationProfile = .standard,
         issues: [String] = [],
+        manifestLocations: [URL] = [],
         _ outcomes: [String: [URL: ItemDestinationOutcome]]
     ) -> TransferReport {
         TransferReport(
@@ -114,9 +115,17 @@ struct TaskVerdictAggregateTests {
                     outcomes: outcomes[path] ?? [:]
                 )
             },
-            manifestLocations: [],
+            manifestLocations: manifestLocations,
             issues: issues
         )
+    }
+
+    /// The engine's advisory issue for a destination that refused source
+    /// timestamps (`TransferWorker.noteTimestampNotPreserved`), as recorded.
+    static func timestampWarning(at destination: URL) -> String {
+        "Warning: could not preserve source timestamps on 1 file(s) at \(destination.path); " +
+            "file contents are unaffected, but a later cascade from this destination " +
+            "will see a different source-plan fingerprint."
     }
 
     // MARK: - Engine-backed helpers (ported from the G04 repro)
@@ -363,6 +372,53 @@ struct TaskVerdictAggregateTests {
         #expect(afterBoth.verdict == .verified,
                 "repairs that verify every failed pair at every destination complete the task")
         #expect(afterBoth.lifecycle == .complete)
+    }
+
+    /// raid-a refuses source timestamps, so its repair verifies with only an
+    /// advisory warning. A warning is not a transfer-level failure: that
+    /// repair's verified pairs still count, and the task completes once
+    /// shuttle-b is repaired too.
+    @Test func aRepairWhoseOnlyIssueIsATimestampWarningStillCompletesTheTask() async throws {
+        let world = try await Self.makeWorld()
+
+        let refusesTimestamps = FailpointFileSystem(base: RealFileSystem())
+        refusesTimestamps.failModificationTime(pathSuffix: "\(Self.raidName)/DCIM/100MEDIA/a.bin")
+        let repairRaid = try await Self.repair(
+            world, destination: world.raid, fileSystem: refusesTimestamps, spoolName: "repair-raid-spool"
+        )
+        let repairShuttle = try await Self.repair(
+            world, destination: world.shuttle, fileSystem: RealFileSystem(), spoolName: "repair-shuttle-spool"
+        )
+        try #require(repairRaid.status == .verified)
+        try #require(repairRaid.issues.count == 1)
+        try #require(repairRaid.issues.allSatisfy { $0.hasPrefix(TransferWorker.warningIssuePrefix) })
+        try #require(repairShuttle.status == .verified)
+
+        let database = try ProductDatabase(inMemory: true)
+        let operatorProfile = try database.activeProfile()
+        let taskID = UUID()
+        let parentAttemptID = UUID()
+        try Self.catalogParent(
+            world, database: database, taskID: taskID,
+            parentAttemptID: parentAttemptID, operatorProfile: operatorProfile
+        )
+        let raidAttemptID = try Self.catalogRepair(
+            repairRaid, database: database, taskID: taskID,
+            parentAttemptID: parentAttemptID, operatorProfile: operatorProfile
+        )
+        try Self.catalogRepair(
+            repairShuttle, database: database, taskID: taskID,
+            parentAttemptID: parentAttemptID, operatorProfile: operatorProfile
+        )
+
+        let task = try Self.taskRecord(taskID, in: database)
+        #expect(task.verdict == .verified,
+                "a timestamp warning must not stop raid-a's verified repair from counting")
+        #expect(task.lifecycle == .complete)
+        let attempts = try database.attemptHistory(taskID: taskID)
+        let raidRow = try #require(attempts.first(where: { $0.id == raidAttemptID }))
+        #expect(raidRow.verdict == .verified)
+        #expect(raidRow.issues == repairRaid.issues, "the warning stays on the attempt row")
     }
 
     // MARK: - Canned repairs
@@ -668,6 +724,91 @@ struct TaskVerdictAggregateTests {
         let task = try catalog.task()
         #expect(task.verdict == .failed)
         #expect(task.lifecycle == .failed)
+    }
+
+    // MARK: - Advisory warnings
+
+    /// Warnings beside an evidence-write failure neither widen nor narrow it:
+    /// the parent vouches exactly where its manifest landed (raid), not
+    /// everywhere and not nowhere.
+    @Test func warningsBesideAnEvidenceFailureVouchOnlyWhereTheManifestLanded() throws {
+        let raid = Self.raid, shuttle = Self.shuttle, x = Self.clipX, y = Self.clipY
+        let issues = [
+            Self.timestampWarning(at: raid),
+            "Could not write complete transfer evidence to: /synthetic/Shuttle/day01",
+        ]
+
+        // X failed at shuttle; repairing it leaves every pair proven.
+        let repaired = try Catalog()
+        let parent = try repaired.finish(
+            Self.cannedReport(
+                .failed, step: 0, destinations: [raid, shuttle], issues: issues, manifestLocations: [raid],
+                [x: [raid: .verified, shuttle: .failed(Self.mismatch)]]
+            ),
+            kind: .copy
+        )
+        try repaired.finish(
+            Self.cannedReport(.verified, step: 1, destinations: [shuttle], [x: [shuttle: .verified]]),
+            kind: .retry,
+            parent: parent
+        )
+        let repairedTask = try repaired.task()
+        #expect(repairedTask.verdict == .verified, "raid's manifest landed, so the parent vouches there")
+        #expect(repairedTask.lifecycle == .complete)
+
+        // Y's verified copy at shuttle has no manifest behind it and no repair
+        // proves it, so the task stays failed.
+        let unvouched = try Catalog()
+        let unvouchedParent = try unvouched.finish(
+            Self.cannedReport(
+                .failed, step: 0, destinations: [raid, shuttle], issues: issues, manifestLocations: [raid],
+                [
+                    x: [raid: .verified, shuttle: .failed(Self.mismatch)],
+                    y: [raid: .verified, shuttle: .verified],
+                ]
+            ),
+            kind: .copy
+        )
+        try unvouched.finish(
+            Self.cannedReport(.verified, step: 1, destinations: [shuttle], [x: [shuttle: .verified]]),
+            kind: .retry,
+            parent: unvouchedParent
+        )
+        let unvouchedTask = try unvouched.task()
+        #expect(unvouchedTask.verdict == .failed, "the parent cannot vouch where its manifest is missing")
+        #expect(unvouchedTask.lifecycle == .failed)
+    }
+
+    /// A parent whose only issue is a warning vouches everywhere, so repairing
+    /// its one failed pair verifies the task. Any other transfer-level issue
+    /// beside the warning still makes it vouch for nothing.
+    @Test(arguments: [false, true])
+    func onlyNonWarningIssuesStopAParentFromVouching(parentAlsoVetoed: Bool) throws {
+        let raid = Self.raid, shuttle = Self.shuttle, x = Self.clipX, y = Self.clipY
+        let issues = [Self.timestampWarning(at: shuttle)]
+            + (parentAlsoVetoed ? ["The source file list changed before the transfer finished."] : [])
+        let catalog = try Catalog()
+        let parent = try catalog.finish(
+            Self.cannedReport(.failed, step: 0, destinations: [raid, shuttle], issues: issues, [
+                x: [raid: .failed(.writeFailed(detail: "No space left on device")), shuttle: .verified],
+                y: [raid: .verified, shuttle: .verified],
+            ]),
+            kind: .copy
+        )
+        try catalog.finish(
+            Self.cannedReport(.verified, step: 1, destinations: [raid], [x: [raid: .verified]]),
+            kind: .retry,
+            parent: parent
+        )
+
+        let task = try catalog.task()
+        if parentAlsoVetoed {
+            #expect(task.verdict == .failed, "a warning does not excuse a transfer-level failure")
+            #expect(task.lifecycle == .failed)
+        } else {
+            #expect(task.verdict == .verified, "a warning alone is not a transfer-level failure")
+            #expect(task.lifecycle == .complete)
+        }
     }
 }
 

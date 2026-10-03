@@ -1110,7 +1110,8 @@ final class ProductDatabase: @unchecked Sendable {
 
     /// The engine's transfer issue for evidence it could not write to some
     /// roots (`TransferWorker.finish`). Only this issue is scoped per
-    /// destination; every other issue makes the attempt vouch for nothing.
+    /// destination. Advisory warnings (`TransferWorker.warningIssuePrefix`)
+    /// are neutral; every other issue makes the attempt vouch for nothing.
     static let evidenceWriteIssuePrefix = "Could not write complete transfer evidence to: "
 
     /// Destinations an attempt recorded results for.
@@ -1157,7 +1158,10 @@ final class ProductDatabase: @unchecked Sendable {
         for row in rows {
             let attemptKey: String = row["id"]
             let issuesJSON: String = row["issues_json"]
-            let issues = try? decoder.decode([String].self, from: Data(issuesJSON.utf8))
+            // Advisory warnings never fail a run, so they never narrow what
+            // it vouches for: the attempt is judged as if they were absent.
+            let issues = (try? decoder.decode([String].self, from: Data(issuesJSON.utf8)))?
+                .filter { !$0.hasPrefix(TransferWorker.warningIssuePrefix) }
             let vouching: TaskVerdictRollup.Vouching
             if let issues, issues.isEmpty {
                 vouching = .everywhere
@@ -1315,7 +1319,7 @@ enum TaskVerdictRollup {
 
     /// Where an attempt's own results count as evidence.
     enum Vouching: Sendable, Equatable {
-        /// No transfer-level issue.
+        /// No transfer-level issue other than advisory warnings.
         case everywhere
         /// Evidence could not be written everywhere; its results count only
         /// at destinations where its manifest landed.
