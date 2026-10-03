@@ -229,6 +229,54 @@ struct VolumeIndependenceTests {
         if let device = first.physicalDeviceIdentifier { #expect(device.hasPrefix("disk:")) }
     }
 
+    /// The queue starts a transfer only while none of its resources is held
+    /// by a running one (`AppModel.scheduleQueued`). Beside each volume they
+    /// name the physical device behind it, so two volumes on one disk wait
+    /// for each other. A recovered card is built because it never writes a
+    /// journal.
+    @MainActor
+    @Test func queueResourcesNameThePhysicalDeviceBehindEachVolume() throws {
+        let fixtures = try FixtureBuilder()
+        let card = try fixtures.makeCard(files: [.init("DCIM/100/A001.MOV", size: 4096, seed: 1)])
+        let shuttle = try fixtures.makeDestination(named: "Shuttle")
+        let scratch = try RealFileSystem().volume(at: shuttle)
+        let session = TransferSession(interrupted: TransferJournal(
+            id: UUID(),
+            label: "20261002_A001",
+            source: card,
+            destinationBases: [shuttle],
+            destinations: [shuttle.appendingPathComponent("20261002_A001", isDirectory: true)],
+            algorithm: .xxh64,
+            allowSameVolume: true,
+            createdAt: Date(),
+            startedAt: Date(),
+            itemCount: 1,
+            totalBytes: 4096,
+            status: .interrupted
+        ))
+
+        // A virtual CI boot disk has no known device; then the volume alone.
+        let expected = Set([scratch.identifier] + [scratch.physicalDeviceIdentifier].compactMap { $0 })
+        #expect(session.resourceIDs == expected)
+    }
+
+    /// The key mapping itself, independent of this host's hardware: each
+    /// volume contributes its identifier and, when known, its device; two
+    /// volumes on one disk share the device key, and an unknown device adds
+    /// nothing.
+    @Test func queueResourcesAddEachKnownDeviceBesideItsVolume() {
+        let card = FileSystemVolume(identifier: "card", name: "A001", mountPath: "/Volumes/A001", physicalDeviceIdentifier: "disk:disk4@11")
+        let raidA = FileSystemVolume(identifier: "raid-a", name: "RAID A", mountPath: "/Volumes/RAID A", physicalDeviceIdentifier: "disk:disk6@42")
+        let raidB = FileSystemVolume(identifier: "raid-b", name: "RAID B", mountPath: "/Volumes/RAID B", physicalDeviceIdentifier: "disk:disk6@42")
+        let unknown = FileSystemVolume(identifier: "share", name: "Share", mountPath: "/Volumes/Share")
+
+        #expect(TransferSession.queueResources(of: [card, raidA, raidB, unknown])
+            == ["card", "disk:disk4@11", "raid-a", "raid-b", "disk:disk6@42", "share"])
+        #expect(!TransferSession.queueResources(of: [raidA]).isDisjoint(with: TransferSession.queueResources(of: [raidB])),
+                "two volumes on one disk hold one queue resource")
+        #expect(TransferSession.queueResources(of: [unknown]) == ["share"])
+    }
+
     @Test func unknownBSDNameHasNoPhysicalDisk() {
         #expect(RealFileSystem.wholePhysicalDisk(forBSDName: "doppelganger-no-such-disk") == nil)
     }

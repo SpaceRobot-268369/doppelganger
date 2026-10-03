@@ -14,6 +14,15 @@ struct NewOffloadPage: View {
     @State private var scanning = false
     @State private var warningsAcknowledged = false
     @State private var selectedPresetID: UUID?
+    /// Bumped by every draft edit and every new scan. A scan that finishes
+    /// under an older generation ran against a draft that has since changed,
+    /// so its result is dropped instead of shown as startable.
+    @State private var scanGeneration = 0
+    /// Why the reviewed Directly-in-destination batch cannot start: paths two
+    /// of its sources would both write into one destination. It depends only
+    /// on the reviewed plans and walks every item in them, so it is worked out
+    /// when `preflights` is set and cleared with it, not on every render.
+    @State private var directLayoutCollision: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -383,10 +392,37 @@ struct NewOffloadPage: View {
                 Label(message, systemImage: "info.circle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            } else if let collision = model.draftFolderNameCollision {
+                Label(
+                    L10n.format(
+                        "Two sources would write to %@. Change the Reel Name or remove a source.",
+                        collision
+                    ),
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
             } else if !model.draftFolderNamesAreUnique {
                 Label("Every source needs a unique folder name.", systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
+            } else if let directLayoutCollision {
+                // Start stays disabled; running preflight again cannot clear
+                // this, only the New folder layout or another source can.
+                Label(directLayoutCollision, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else if let stale = preflights.first(where: { !model.reviewedFolderNameIsCurrent($0) }) {
+                // Start stays disabled until the review runs again; say why.
+                Label(
+                    L10n.format(
+                        "The folder name for %@ changed after preflight. Run preflight again.",
+                        stale.source.lastPathComponent
+                    ),
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
             Spacer()
             Button("Cancel", action: onClose)
@@ -410,8 +446,12 @@ struct NewOffloadPage: View {
                 .buttonStyle(.glassProminent)
                 .tint(.blue)
                 .disabled(
-                    scanning || preflights.contains(where: { !$0.canStart })
-                        || (preflights.contains(where: \.requiresAcknowledgement) && !warningsAcknowledged)
+                    scanning || !Self.reviewedBatchCanStart(
+                        preflights,
+                        model: model,
+                        warningsAcknowledged: warningsAcknowledged,
+                        directLayoutCollision: directLayoutCollision
+                    )
                 )
                 .keyboardShortcut(.defaultAction)
             }
@@ -426,10 +466,30 @@ struct NewOffloadPage: View {
         }
     }
 
+    /// Whether Start may take the reviewed plans as they stand.
+    /// `AppModel.startDraftOffloads` refuses each of these again; checking
+    /// them here keeps the button from offering a batch it would refuse.
+    static func reviewedBatchCanStart(
+        _ preflights: [TransferPreflight],
+        model: AppModel,
+        warningsAcknowledged: Bool,
+        directLayoutCollision: String?
+    ) -> Bool {
+        !preflights.isEmpty
+            && preflights.allSatisfy(\.canStart)
+            && (!preflights.contains(where: \.requiresAcknowledgement) || warningsAcknowledged)
+            // The reviewed folders must still be the ones the draft names.
+            && preflights.allSatisfy { model.reviewedFolderNameIsCurrent($0) }
+            // No two sources written directly into one destination share a path.
+            && directLayoutCollision == nil
+    }
+
     // MARK: - Preflight
 
     private func runPreflight() {
         guard model.canStartDraft, model.draftFolderNamesAreUnique else { return }
+        scanGeneration += 1
+        let generation = scanGeneration
         let plans = model.draftSources.map { source in
             (
                 source: source,
@@ -462,16 +522,21 @@ struct NewOffloadPage: View {
             }
             let bySource = Dictionary(uniqueKeysWithValues: scanned.map { ($0.source, $0) })
             let ordered = plans.compactMap { bySource[$0.source] }
-            // The draft may have changed while the scan ran; a stale plan must
-            // never become a startable one.
-            guard ordered.count == plans.count,
+            // The draft may have changed while the scan ran: a Reel Name typed,
+            // a camera picked, a source added. Every check reads the live
+            // draft, never what was captured when the scan began; a stale plan
+            // must never become a startable one.
+            guard generation == scanGeneration,
+                  ordered.count == plans.count,
+                  plans.map({ $0.source.standardizedFileURL })
+                    == model.draftSources.map(\.standardizedFileURL),
                   algorithm == model.draftAlgorithm,
                   layout == model.draftDestinationLayout,
                   zip(ordered, plans).allSatisfy({ result, plan in
                       result.matches(
                           source: plan.source,
                           destinations: model.draftDestinations,
-                          folderName: plan.folderName,
+                          folderName: model.draftFolderName(for: plan.source),
                           layout: layout,
                           includedRelativePaths: result.includedRelativePaths
                       )
@@ -481,12 +546,16 @@ struct NewOffloadPage: View {
                 return
             }
             preflights = ordered
+            directLayoutCollision = AppModel.directLayoutCollisionMessage(for: ordered)
             scanning = false
         }
     }
 
     private func invalidatePreflight() {
+        // Also retires a scan still in flight: its result will be dropped.
+        scanGeneration += 1
         preflights = []
+        directLayoutCollision = nil
         warningsAcknowledged = false
     }
 

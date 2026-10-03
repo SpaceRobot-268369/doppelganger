@@ -1,6 +1,117 @@
 import Foundation
 import Observation
 
+// MARK: - Source eject gate
+
+/// What a verified attempt may offer for its source card, and why. Only
+/// `.available` ever reaches an unmount.
+enum SourceEjectEligibility: Equatable, Sendable {
+    /// Not verified, not a removable whole-volume source, or no recorded volume.
+    case notOffered
+    /// The recorded volume has no UUID, so a same-named card mounted at the
+    /// same path could not be told apart from it.
+    case identityUnverifiable
+    /// Nothing is mounted at the recorded mount point any more.
+    case sourceGone
+    /// Something is mounted at the recorded mount point, but not this card.
+    case differentVolumeMounted
+    /// Other queued or running transfers still use this volume.
+    case inUse(count: Int)
+    case available
+}
+
+/// One dashboard attempt's hold on storage, as the eject gate sees it.
+struct SourceEjectClaim: Equatable, Sendable {
+    let sessionID: UUID
+    let isActive: Bool
+    /// Volume identifiers of the attempt's source and destination bases.
+    let volumeIdentifiers: Set<String>
+    /// Canonical source and destination-base paths, which still match when
+    /// a volume could not be resolved.
+    let paths: [String]
+}
+
+enum SourceEjectOutcome: Equatable, Sendable {
+    case ejected
+    case refused(SourceEjectEligibility)
+    case failed(String)
+
+    var message: String {
+        switch self {
+        case .ejected:
+            L10n.text("Source safely ejected.")
+        case .failed(let reason):
+            L10n.format("Could not eject source: %@", reason)
+        case .refused(.sourceGone):
+            L10n.text("Not ejected: the verified source is no longer mounted.")
+        case .refused(.differentVolumeMounted):
+            L10n.text("Not ejected: a different volume is now mounted where the verified source was.")
+        case .refused(.inUse(let count)):
+            count == 1
+                ? L10n.text("Not ejected: another transfer still uses this source.")
+                : L10n.format("Not ejected: %lld other transfers still use this source.", Int64(count))
+        case .refused:
+            L10n.text("Not ejected: Doppelganger could not confirm this is the verified source volume.")
+        }
+    }
+}
+
+/// The Eject Source decision as a pure function of snapshots.
+enum SourceEjectGate {
+    static func evaluate(
+        sessionID: UUID,
+        verdict: TransferStatus?,
+        sourcePath: String,
+        recorded: FileSystemVolume?,
+        live: FileSystemVolume?,
+        claims: [SourceEjectClaim]
+    ) -> SourceEjectEligibility {
+        guard verdict == .verified,
+              let recorded,
+              recorded.isRemovable,
+              sourcePath == recorded.mountPath
+        else { return .notOffered }
+        guard hasStableIdentity(recorded) else { return .identityUnverifiable }
+        // volume(at:) walks up from a mount point that no longer exists, so an
+        // ejected or pulled card resolves to the parent volume and lands here.
+        guard let live, live.mountPath == recorded.mountPath else { return .sourceGone }
+        guard live.identifier == recorded.identifier,
+              live.isRemovable,
+              live.totalBytes == recorded.totalBytes
+        else { return .differentVolumeMounted }
+        let mountPrefix = recorded.mountPath + "/"
+        let users = claims.filter { claim in
+            claim.sessionID != sessionID && claim.isActive && (
+                claim.volumeIdentifiers.contains(recorded.identifier)
+                    || claim.paths.contains { $0 == recorded.mountPath || $0.hasPrefix(mountPrefix) }
+            )
+        }
+        return users.isEmpty ? .available : .inUse(count: users.count)
+    }
+
+    /// Only a real volume UUID tells two same-named cards apart. RealFileSystem
+    /// falls back to the mount path when a volume reports none.
+    static func hasStableIdentity(_ volume: FileSystemVolume) -> Bool {
+        UUID(uuidString: volume.identifier) != nil
+    }
+
+    /// Calls `eject` only for `.available`, and with the checked mount point.
+    static func perform(
+        _ eligibility: SourceEjectEligibility,
+        mountPath: String?,
+        eject: (URL) throws -> Void
+    ) -> SourceEjectOutcome {
+        guard eligibility == .available else { return .refused(eligibility) }
+        guard let mountPath else { return .refused(.notOffered) }
+        do {
+            try eject(URL(fileURLWithPath: mountPath, isDirectory: true))
+            return .ejected
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+}
+
 /// One transfer, from launch to terminal report. Each session owns its own
 /// engine instance, so several offloads can run side by side; the dashboard
 /// lists sessions in creation order.
@@ -73,7 +184,9 @@ final class TransferSession: Identifiable {
     private var journal: TransferJournal
     private let resumeManifest: TransferManifest?
     private let retryManifest: TransferManifest?
-    private let includedRelativePaths: Set<String>?
+    /// The exact source items this attempt was asked to transfer, or `nil`
+    /// for the whole source. A resume carries it forward unchanged.
+    let includedRelativePaths: Set<String>?
     private let duplicateManifests: [String: TransferManifest]
 
     /// Recent (time, bytes) samples for the sliding-window rate — overall and
@@ -98,6 +211,7 @@ final class TransferSession: Identifiable {
         allowSameVolume: Bool = false,
         createdAt: Date = Date(),
         recoveredIssue: String? = nil,
+        restoredReport: TransferReport? = nil,
         resumeManifest: TransferManifest? = nil,
         retryManifest: TransferManifest? = nil,
         includedRelativePaths: Set<String>? = nil,
@@ -155,10 +269,17 @@ final class TransferSession: Identifiable {
             startedAt: nil,
             itemCount: 0,
             totalBytes: 0,
-            status: .queued
+            status: .queued,
+            includedRelativePaths: includedRelativePaths?.sorted()
         )
 
-        if let recoveredIssue {
+        if let restoredReport {
+            // Offered again after relaunch: show the finished verdict and never
+            // touch the journal, which still records it exactly.
+            started = true
+            shortID = restoredReport.shortID
+            report = restoredReport
+        } else if let recoveredIssue {
             started = true
             shortID = String(id.uuidString.prefix(8)).lowercased()
             planItemCount = journal.itemCount
@@ -194,7 +315,10 @@ final class TransferSession: Identifiable {
         }
     }
 
-    convenience init(interrupted journal: TransferJournal) {
+    convenience init(
+        interrupted journal: TransferJournal,
+        issue: String = "The app exited before this transfer produced a terminal report. Treat every output as incomplete and keep the source media."
+    ) {
         self.init(
             id: journal.id,
             taskID: journal.taskID,
@@ -215,7 +339,38 @@ final class TransferSession: Identifiable {
             sourceFingerprint: journal.sourceFingerprint,
             allowSameVolume: journal.allowSameVolume,
             createdAt: journal.createdAt,
-            recoveredIssue: "The app exited before this transfer produced a terminal report. Treat every output as incomplete and keep the source media."
+            recoveredIssue: issue,
+            includedRelativePaths: journal.includedRelativePaths.map { Set($0) }
+        )
+        planItemCount = journal.itemCount
+        planTotalBytes = journal.totalBytes
+    }
+
+    /// A paused or Fast-pending attempt offered again after relaunch.
+    convenience init(restoring attempt: RestorableAttempt) {
+        let journal = attempt.journal
+        self.init(
+            id: journal.id,
+            taskID: journal.taskID,
+            parentAttemptID: journal.parentAttemptID,
+            attemptKind: journal.attemptKind ?? .copy,
+            label: journal.label,
+            source: journal.source,
+            destinations: zip(journal.destinationBases, journal.destinations).map {
+                TransferDestination(baseRoot: $0.0, outputRoot: $0.1)
+            },
+            algorithm: journal.algorithm,
+            verificationProfile: journal.verificationProfile ?? .standard,
+            operatorProfile: OperatorProfile(
+                id: journal.operatorProfileID ?? UUID(),
+                displayName: journal.operatorDisplayName ?? "Unknown Operator"
+            ),
+            projectID: journal.projectID,
+            sourceFingerprint: journal.sourceFingerprint,
+            allowSameVolume: journal.allowSameVolume,
+            createdAt: journal.createdAt,
+            restoredReport: attempt.report,
+            includedRelativePaths: journal.includedRelativePaths.map { Set($0) }
         )
         planItemCount = journal.itemCount
         planTotalBytes = journal.totalBytes
@@ -266,12 +421,21 @@ final class TransferSession: Identifiable {
         return destinationBases[index]
     }
 
-    /// Queue resources are volume identifiers, not folder paths.
+    /// Queue resources are volume identifiers, not folder paths, plus the
+    /// physical device behind each volume when it is known
+    /// (`FileSystemVolume.physicalDeviceIdentifier`, valid for this boot and
+    /// never persisted). Two APFS volumes or partitions on one disk, or two
+    /// shares from one server, are one device, so the queue never runs two
+    /// transfers on it side by side.
     var resourceIDs: Set<String> {
         let fileSystem = RealFileSystem()
-        return Set(([source] + destinationBases).compactMap {
-            try? fileSystem.volume(at: $0).identifier
-        })
+        return Self.queueResources(
+            of: ([source] + destinationBases).compactMap { try? fileSystem.volume(at: $0) }
+        )
+    }
+
+    nonisolated static func queueResources(of volumes: [FileSystemVolume]) -> Set<String> {
+        Set(volumes.flatMap { [$0.identifier] + [$0.physicalDeviceIdentifier].compactMap { $0 } })
     }
 
     // MARK: - Lifecycle
@@ -375,13 +539,9 @@ final class TransferSession: Identifiable {
             logStore?.close()
             logStore = nil
             report = finished
-            journal.status = switch finished.status {
-            case .paused: .paused
-            case .transferredPendingVerification: .transferredPendingVerification
-            case .verified: .verified
-            case .failed: .failed
-            case .cancelled: .cancelled
-            }
+            // Paused and Fast-pending attempts are offered again after relaunch;
+            // a linked attempt stopped before any destination releases its parent.
+            journal.recordVerdict(of: finished)
             journalStore.save(journal)
             onFinished?()
         }
@@ -760,10 +920,108 @@ final class TransferSession: Identifiable {
         return nil
     }
 
-    var canEjectSource: Bool {
-        guard report?.status == .verified, let sourceVolume else { return false }
-        return sourceVolume.isRemovable
-            && RealFileSystem().canonicalURL(source).path == sourceVolume.mountPath
+    // MARK: - Source eject
+
+    /// What the action row may offer for this attempt's source card. It runs
+    /// on every render of a verified card, so it reads only what is already
+    /// known: the volume watcher's list for the card mounted now, and what
+    /// each other attempt recorded at creation for the claims. Reading
+    /// `mounted` re-renders the card on every mount change, and a mount point
+    /// the watcher no longer lists counts as gone. `ejectSource` re-reads
+    /// everything before it unmounts.
+    func sourceEjectEligibility(
+        among sessions: [TransferSession],
+        mounted: [MountedVolume]
+    ) -> SourceEjectEligibility {
+        guard report?.status == .verified else { return .notOffered }
+        return evaluateSourceEject(
+            live: Self.watchedVolume(at: sourceVolume?.mountPath, among: mounted),
+            claims: sessions.filter { $0.id != id && $0.isActive }.map(\.recordedEjectClaim)
+        )
+    }
+
+    /// Re-reads the card at the recorded mount point and every other active
+    /// attempt's volumes, re-runs every check, and unmounts only when all of
+    /// them pass. Nothing suspends between the last check and `eject`.
+    func ejectSource(
+        among sessions: [TransferSession],
+        mounted: [MountedVolume],
+        eject: (URL) throws -> Void
+    ) -> SourceEjectOutcome {
+        let eligibility: SourceEjectEligibility = report?.status == .verified
+            ? evaluateSourceEject(
+                live: liveSourceVolume(mounted: mounted, fileSystem: RealFileSystem()),
+                claims: sessions.filter { $0.id != id && $0.isActive }.map(\.sourceEjectClaim)
+            )
+            : .notOffered
+        return SourceEjectGate.perform(eligibility, mountPath: sourceVolume?.mountPath, eject: eject)
+    }
+
+    private func evaluateSourceEject(
+        live: FileSystemVolume?,
+        claims: [SourceEjectClaim]
+    ) -> SourceEjectEligibility {
+        SourceEjectGate.evaluate(
+            sessionID: id,
+            verdict: report?.status,
+            sourcePath: RealFileSystem().canonicalURL(source).path,
+            recorded: sourceVolume,
+            live: live,
+            claims: claims
+        )
+    }
+
+    /// The storage this attempt holds while it is queued or running, re-read
+    /// now: every volume it touches and its resolved paths.
+    var sourceEjectClaim: SourceEjectClaim {
+        let fileSystem = RealFileSystem()
+        return SourceEjectClaim(
+            sessionID: id,
+            isActive: isActive,
+            volumeIdentifiers: resourceIDs.union(sourceVolume.map { [$0.identifier] } ?? []),
+            paths: ([source] + destinationBases).map { fileSystem.canonicalURL($0).path }
+        )
+    }
+
+    /// The same hold from what the attempt recorded at creation: its source
+    /// volume, and its paths standardized but not resolved. Cheap enough for
+    /// every render; a destination reached through another path is caught by
+    /// `sourceEjectClaim` at click time.
+    private var recordedEjectClaim: SourceEjectClaim {
+        SourceEjectClaim(
+            sessionID: id,
+            isActive: isActive,
+            volumeIdentifiers: sourceVolume.map { [$0.identifier] } ?? [],
+            paths: ([source] + destinationBases).map(\.standardizedFileURL.path)
+        )
+    }
+
+    /// The volume mounted at the recorded source mount point, re-read now.
+    private func liveSourceVolume(
+        mounted: [MountedVolume],
+        fileSystem: RealFileSystem
+    ) -> FileSystemVolume? {
+        guard let mountPath = sourceVolume?.mountPath,
+              mounted.contains(where: { $0.url.standardizedFileURL.path == mountPath })
+        else { return nil }
+        return try? fileSystem.volume(at: URL(fileURLWithPath: mountPath, isDirectory: true))
+    }
+
+    /// The volume the watcher lists at `mountPath`, in the shape the gate
+    /// compares. Its identity is the volume UUID, or the mount path when it
+    /// reports none, as `RealFileSystem` falls back; an unreported capacity
+    /// stays unknown rather than reading as zero.
+    nonisolated static func watchedVolume(at mountPath: String?, among mounted: [MountedVolume]) -> FileSystemVolume? {
+        guard let mountPath,
+              let volume = mounted.first(where: { $0.url.standardizedFileURL.path == mountPath })
+        else { return nil }
+        return FileSystemVolume(
+            identifier: volume.volumeIdentifier ?? mountPath,
+            name: volume.name,
+            mountPath: mountPath,
+            totalBytes: volume.totalBytes > 0 ? volume.totalBytes : nil,
+            isRemovable: volume.isRemovable
+        )
     }
 
     /// Removes only hidden staging files generated by this transfer ID. Final

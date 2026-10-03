@@ -369,6 +369,30 @@ final class ProductStore {
         }
     }
 
+    /// Launch reconciliation (`ProductDatabase.closeAbandonedRuns`). AppModel
+    /// calls this once, after journal recovery and before any session of this
+    /// launch exists.
+    func closeAbandonedRuns(before launchedAt: Date) {
+        guard let database else { return }
+        do {
+            try database.closeAbandonedRuns(before: launchedAt)
+        } catch {
+            lastError = error.localizedDescription
+        }
+        reloadTaskHistory()
+    }
+
+    /// Close a withdrawn queued task in the catalog, credited to the active
+    /// profile. A task that already started an attempt is left alone.
+    func withdrawQueuedTask(id: UUID) {
+        do {
+            try database?.withdrawQueuedTask(id: id, operatorProfile: activeProfile)
+            reloadTaskHistory()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
     func auditEvents(taskID: UUID? = nil) -> [AuditEventRecord] {
         do {
             return try database?.auditEvents(taskID: taskID) ?? []

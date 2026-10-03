@@ -701,6 +701,10 @@ final class ProductDatabase: @unchecked Sendable {
 
     /// Idempotently indexes portable manifests left by earlier app versions.
     /// The importer is read-only with respect to the spool and its evidence.
+    /// The catalog's own record wins: a manifest whose attempt the catalog
+    /// already finished is only remembered, and one whose attempt is still
+    /// open is skipped — launch reconciliation closes that attempt as failed,
+    /// never from a manifest it may not own.
     func importSpoolManifests(at root: URL, fallbackProfile: OperatorProfile) throws {
         let manager = FileManager.default
         guard let enumerator = manager.enumerator(
@@ -771,6 +775,26 @@ final class ProductDatabase: @unchecked Sendable {
             }
 
             try writer.write { db in
+                switch try Self.catalogState(ofAttempt: attemptID, db: db) {
+                case .open:
+                    // Never reached a terminal report: this file is uncommitted
+                    // evidence (journal recovery removes it). Write nothing,
+                    // not even bookkeeping.
+                    return
+                case .finished:
+                    // finishAttempt already cataloged the files, evidence, and
+                    // the one terminal event. Only remember the file.
+                    try Self.recordImportedManifest(
+                        canonicalPath: canonicalPath,
+                        transferID: manifest.transferID,
+                        schemaVersion: manifest.schemaVersion,
+                        modifiedAt: modifiedAt,
+                        db: db
+                    )
+                    return
+                case .absent:
+                    break // A manifest the catalog has never seen: import it.
+                }
                 try db.execute(sql: """
                     INSERT OR IGNORE INTO transfer_tasks
                         (id, label, source_path, destination_paths_json, project_id,
@@ -845,26 +869,174 @@ final class ProductDatabase: @unchecked Sendable {
                         taskID: taskID,
                         attemptID: attemptID,
                         actorKind: .system,
-                        action: verdict == .verified ? .attemptCompleted : .attemptFailed,
+                        action: Self.terminalAuditAction(for: verdict),
                         occurredAt: finishedAt,
                         detail: "Imported existing spool manifest"
                     ),
                     db: db
                 )
-                try db.execute(sql: """
-                    INSERT INTO imported_manifests
-                        (canonical_path, transfer_id, schema_version, modified_at, imported_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(canonical_path) DO UPDATE SET
-                        transfer_id = excluded.transfer_id,
-                        schema_version = excluded.schema_version,
-                        modified_at = excluded.modified_at,
-                        imported_at = excluded.imported_at
-                    """, arguments: [
-                        canonicalPath, manifest.transferID, manifest.schemaVersion,
-                        modifiedAt.timeIntervalSince1970, Date().timeIntervalSince1970
-                    ])
+                try Self.recordImportedManifest(
+                    canonicalPath: canonicalPath,
+                    transferID: manifest.transferID,
+                    schemaVersion: manifest.schemaVersion,
+                    modifiedAt: modifiedAt,
+                    db: db
+                )
             }
+        }
+    }
+
+    // MARK: - Abandoned runs
+
+    /// Stored on an attempt that was still open when the app launched. It is
+    /// provenance, not display text, so — like the engine's own issues — it is
+    /// not localized. It repeats the recovered dashboard card's wording.
+    static let abandonedAttemptIssue = "The app exited before this transfer produced a terminal report. Treat every output as incomplete and keep the source media."
+    /// Audit detail for a queued task the app left behind before any attempt.
+    /// Worded from the catalog's side: it never claims nothing was copied.
+    static let neverStartedTaskDetail = "Closed at launch: the app quit before this queued transfer recorded an attempt."
+    /// Audit detail for a queued task the operator withdrew.
+    static let withdrawnTaskDetail = "Withdrawn from the queue before it started."
+
+    struct AbandonedRuns: Equatable, Sendable {
+        var failedAttemptIDs: [UUID] = []
+        var cancelledTaskIDs: [UUID] = []
+    }
+
+    /// Launch reconciliation: closes what no process can still be running.
+    ///
+    /// Call once per launch, before this launch starts any attempt.
+    /// - An attempt registered at or before `launchedAt` that never finished
+    ///   was abandoned by an earlier process (crash, force quit, Quit Anyway).
+    ///   It is closed through `finishAttempt` as failed, so the task aggregate
+    ///   settles exactly as for any other failed attempt. It is never closed
+    ///   as anything else: nothing it left behind is evidence.
+    /// - A task registered at or before `launchedAt` that is still queued and
+    ///   never started an attempt is closed as cancelled.
+    /// Finished attempts and tasks that have moved on are never touched, so a
+    /// second run changes nothing. A row that fails to close stays open (never
+    /// read as success) and is retried at the next launch.
+    @discardableResult
+    func closeAbandonedRuns(before launchedAt: Date, closedAt: Date = Date()) throws -> AbandonedRuns {
+        struct OpenAttempt: Sendable {
+            let id: UUID
+            let taskID: UUID
+            let algorithm: ChecksumAlgorithm
+            let profile: VerificationProfile
+            let sourcePath: String
+            let startedAt: Date
+        }
+        let bound = launchedAt.timeIntervalSince1970
+        let open: [OpenAttempt] = try writer.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT a.id, a.task_id, a.checksum_algorithm, a.verification_profile,
+                       a.started_at, t.source_path
+                FROM transfer_attempts a
+                JOIN transfer_tasks t ON t.id = a.task_id
+                WHERE a.finished_at IS NULL AND COALESCE(a.started_at, 0) <= ?
+                ORDER BY COALESCE(a.started_at, 0), a.rowid
+                """, arguments: [bound]).compactMap { row in
+                guard let id = UUID(uuidString: row["id"]),
+                      let taskID = UUID(uuidString: row["task_id"])
+                else { return nil }
+                let started: Double? = row["started_at"]
+                return OpenAttempt(
+                    id: id,
+                    taskID: taskID,
+                    // Only shapes the in-memory report: finishAttempt never
+                    // persists a report's algorithm or profile.
+                    algorithm: Self.algorithm(fromManifestValue: row["checksum_algorithm"]) ?? .xxh3,
+                    profile: VerificationProfile(rawValue: row["verification_profile"]) ?? .standard,
+                    sourcePath: row["source_path"],
+                    startedAt: started.map(Date.init(timeIntervalSince1970:)) ?? closedAt
+                )
+            }
+        }
+
+        var closed = AbandonedRuns()
+        var firstError: (any Error)?
+        for attempt in open {
+            let report = TransferReport(
+                id: attempt.id,
+                status: .failed,
+                algorithm: attempt.algorithm,
+                verificationProfile: attempt.profile,
+                taskID: attempt.taskID,
+                sourceRoot: URL(fileURLWithPath: attempt.sourcePath, isDirectory: true),
+                // No destinations, items, or manifest locations: an abandoned
+                // attempt committed no evidence, so finishAttempt records no
+                // file results and probes no destination MHL chain on its
+                // behalf (recovery may already have rolled that chain back).
+                destinations: [],
+                startedAt: attempt.startedAt,
+                finishedAt: closedAt,
+                items: [],
+                manifestLocations: [],
+                issues: [Self.abandonedAttemptIssue]
+            )
+            do {
+                try finishAttempt(
+                    id: attempt.id,
+                    taskID: attempt.taskID,
+                    report: report,
+                    verificationProfile: attempt.profile
+                )
+                closed.failedAttemptIDs.append(attempt.id)
+            } catch {
+                firstError = firstError ?? error
+            }
+        }
+
+        do {
+            closed.cancelledTaskIDs = try writer.write { db in
+                let keys = try String.fetchAll(db, sql: """
+                    SELECT t.id FROM transfer_tasks t
+                    WHERE t.lifecycle = ? AND t.verdict = ? AND t.created_at <= ?
+                      AND NOT EXISTS (SELECT 1 FROM transfer_attempts a WHERE a.task_id = t.id)
+                    ORDER BY t.created_at
+                    """, arguments: [
+                        TaskLifecycle.queued.rawValue, TransferVerdict.pending.rawValue, bound,
+                    ])
+                var cancelled: [UUID] = []
+                for key in keys {
+                    let didCancel = try Self.cancelNeverStartedTask(
+                        key: key,
+                        actorKind: .system,
+                        operatorSnapshot: nil,
+                        detail: Self.neverStartedTaskDetail,
+                        at: closedAt,
+                        db: db
+                    )
+                    if didCancel, let id = UUID(uuidString: key) { cancelled.append(id) }
+                }
+                return cancelled
+            }
+        } catch {
+            firstError = firstError ?? error
+        }
+        if let firstError { throw firstError }
+        return closed
+    }
+
+    /// The operator took a queued transfer out of line before it started. Only
+    /// a task that is still queued, pending, and attempt-free is closed; a
+    /// queued resume or retry belongs to a task with earlier attempts, which
+    /// this never touches.
+    @discardableResult
+    func withdrawQueuedTask(
+        id: UUID,
+        operatorProfile: OperatorProfile,
+        at date: Date = Date()
+    ) throws -> Bool {
+        try writer.write { db in
+            try Self.cancelNeverStartedTask(
+                key: id.uuidString.lowercased(),
+                actorKind: .operatorProfile,
+                operatorSnapshot: OperatorSnapshot(profile: operatorProfile),
+                detail: Self.withdrawnTaskDetail,
+                at: date,
+                db: db
+            )
         }
     }
 
@@ -1258,6 +1430,87 @@ final class ProductDatabase: @unchecked Sendable {
             """, arguments: [
                 UUID().uuidString.lowercased(), attemptID.uuidString.lowercased(),
                 kind, path, required
+            ])
+    }
+
+    /// Closes a task that never started an attempt as cancelled, with one
+    /// audit event. Writes nothing — and returns false — unless the task is
+    /// still queued and pending and has no attempt at all.
+    private static func cancelNeverStartedTask(
+        key: String,
+        actorKind: AuditActorKind,
+        operatorSnapshot: OperatorSnapshot?,
+        detail: String,
+        at date: Date,
+        db: Database
+    ) throws -> Bool {
+        try db.execute(sql: """
+            UPDATE transfer_tasks SET lifecycle = ?, verdict = ?, updated_at = ?
+            WHERE id = ? AND lifecycle = ? AND verdict = ?
+              AND NOT EXISTS (SELECT 1 FROM transfer_attempts WHERE task_id = ?)
+            """, arguments: [
+                TaskLifecycle.cancelled.rawValue, TransferVerdict.cancelled.rawValue,
+                date.timeIntervalSince1970, key,
+                TaskLifecycle.queued.rawValue, TransferVerdict.pending.rawValue, key,
+            ])
+        guard db.changesCount == 1 else { return false }
+        try insertAudit(
+            AuditEventRecord(
+                taskID: UUID(uuidString: key),
+                actorKind: actorKind,
+                operatorSnapshot: operatorSnapshot,
+                action: .taskCancelled,
+                occurredAt: date,
+                detail: detail
+            ),
+            db: db
+        )
+        return true
+    }
+
+    private enum CatalogAttemptState { case absent, open, finished }
+
+    private static func catalogState(ofAttempt id: UUID, db: Database) throws -> CatalogAttemptState {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: "SELECT finished_at FROM transfer_attempts WHERE id = ?",
+            arguments: [id.uuidString.lowercased()]
+        ) else { return .absent }
+        let finished: Double? = row["finished_at"]
+        return finished == nil ? .open : .finished
+    }
+
+    /// The system event that closes an attempt with this verdict — the mapping
+    /// finishAttempt applies to a report's status. A Fast copy is a completed
+    /// attempt (its verdict says verification is pending); a pause is not a
+    /// failure.
+    private static func terminalAuditAction(for verdict: TransferVerdict) -> AuditAction {
+        switch verdict {
+        case .paused: .taskPaused
+        case .verified, .transferredPendingVerification: .attemptCompleted
+        case .pending, .needsAttention, .failed, .cancelled: .attemptFailed
+        }
+    }
+
+    private static func recordImportedManifest(
+        canonicalPath: String,
+        transferID: String,
+        schemaVersion: Int,
+        modifiedAt: Date,
+        db: Database
+    ) throws {
+        try db.execute(sql: """
+            INSERT INTO imported_manifests
+                (canonical_path, transfer_id, schema_version, modified_at, imported_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(canonical_path) DO UPDATE SET
+                transfer_id = excluded.transfer_id,
+                schema_version = excluded.schema_version,
+                modified_at = excluded.modified_at,
+                imported_at = excluded.imported_at
+            """, arguments: [
+                canonicalPath, transferID, schemaVersion,
+                modifiedAt.timeIntervalSince1970, Date().timeIntervalSince1970,
             ])
     }
 
