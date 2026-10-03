@@ -8,7 +8,11 @@ struct TransferCardView: View {
     @Bindable var model: AppModel
     @Bindable var session: TransferSession
     let index: Int
+    /// True for the first *running* session in creation order — the one the
+    /// dashboard opens by itself. List position says nothing about that.
+    var isFirstRunning = false
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expanded = false
     @State private var isEjecting = false
     @State private var ejectMessage: String?
@@ -37,10 +41,16 @@ struct TransferCardView: View {
         )
         .animation(.snappy, value: expanded)
         .onAppear {
-            if session.isRunning && index == 1 { expanded = true }
+            if isFirstRunning { expanded = true }
+        }
+        .onChange(of: isFirstRunning) {
+            if isFirstRunning { expanded = true }
         }
         .onChange(of: session.report?.status) {
-            if session.report != nil { expanded = false }
+            // Only a clean verified result earns the compact row. Failed,
+            // cancelled, paused, and pending-verification cards stay open —
+            // that is exactly when the failure list and safety text matter.
+            if session.report?.status == .verified { expanded = false }
         }
     }
 
@@ -53,7 +63,7 @@ struct TransferCardView: View {
                     .lineLimit(1)
                 Image(systemName: "arrow.right")
                     .foregroundStyle(.tertiary)
-                Text(session.destinations.map { $0.deletingLastPathComponent().lastPathComponent }.joined(separator: " · "))
+                Text(session.destinationBases.map(\.lastPathComponent).joined(separator: " · "))
                     .lineLimit(1)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -81,13 +91,13 @@ struct TransferCardView: View {
                 .font(.callout.weight(.semibold))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-            StatusDot(color: statusDotColor, active: session.isRunning)
+            StatusDot(color: statusDotColor, active: session.isRunning, reduceMotion: reduceMotion)
             OperatorAvatarView(
                 profile: session.operatorProfile,
                 avatarStore: model.productStore.avatars,
                 size: 28
             )
-            .help("Started by \(session.operatorProfile.displayName)")
+            .help(L10n.format("Started by %@", session.operatorProfile.displayName))
             VStack(alignment: .leading, spacing: 2) {
                 Text(session.displayName)
                     .font(.title3.weight(.semibold))
@@ -211,6 +221,7 @@ struct TransferCardView: View {
         case .pendingVerification: return .pendingVerification
         case .paused: return .pending
         case .verified: return .verified
+        case .transferNotVerified: return .problem
         case .failed: return .problem
         }
     }
@@ -235,8 +246,8 @@ struct TransferCardView: View {
                             .fixedSize(horizontal: true, vertical: false)
                     }
                 }
-                labeledValue("FILES", session.planItemCount > 0 ? "\(session.planItemCount)" : "—")
-                labeledValue("ID", session.shortID.isEmpty ? "—" : session.shortID.uppercased())
+                labeledValue(L10n.text("FILES"), session.planItemCount > 0 ? "\(session.planItemCount)" : "—")
+                labeledValue(L10n.text("ID"), session.shortID.isEmpty ? "—" : session.shortID.uppercased())
             }
             Spacer(minLength: 0)
             openFolderButton(session.source, label: "Open source in Finder")
@@ -308,15 +319,18 @@ struct TransferCardView: View {
     }
 
     private func destinationCaption(_ destination: URL) -> String {
-        var caption = "\(Format.bytes(session.planTotalBytes)) · \(Int(session.destinationFraction(destination) * 100))%"
+        var parts = [
+            Format.bytes(session.planTotalBytes),
+            "\(Int(session.destinationFraction(destination) * 100))%",
+        ]
         if let free = session.availableBytesByDestination[destination] {
-            caption += " · \(Format.bytes(free)) free"
+            parts.append(L10n.format("%@ free", Format.bytes(free)))
         }
         let rate = session.destinationThroughput(destination)
-        if rate > 0 { caption += " · \(Format.rate(rate))" }
-        if let eta = session.destinationETA(destination) { caption += " · \(Format.eta(eta))" }
-        if session.isBottleneck(destination) { caption += " · bottleneck" }
-        return caption
+        if rate > 0 { parts.append(Format.rate(rate)) }
+        if let eta = session.destinationETA(destination) { parts.append(Format.eta(eta)) }
+        if session.isBottleneck(destination) { parts.append(L10n.text("bottleneck")) }
+        return parts.joined(separator: " · ")
     }
 
     private func statusColor(_ state: TransferSession.DestinationState, errors: Int) -> Color {
@@ -328,6 +342,7 @@ struct TransferCardView: View {
         case .pendingVerification: return .yellow
         case .paused: return .blue
         case .verified: return .green
+        case .transferNotVerified: return .red
         case .failed: return .red
         }
     }
@@ -339,6 +354,12 @@ struct TransferCardView: View {
             Image(systemName: "checkmark.circle")
                 .font(.title2)
                 .foregroundStyle(.green)
+        case .transferNotVerified:
+            // Copies landed here, but the transfer did not verify: red, and
+            // a different mark from a destination whose own pairs failed.
+            Image(systemName: "exclamationmark.circle")
+                .font(.title2)
+                .foregroundStyle(.red)
         case .pendingVerification:
             Image(systemName: "clock.badge.exclamationmark")
                 .font(.title2)
@@ -371,10 +392,10 @@ struct TransferCardView: View {
                 .contentTransition(.numericText())
                 .animation(.snappy, value: Int(session.overallFraction * 100))
             if session.throughputBytesPerSecond > 0 {
-                statBlock(Format.rate(session.throughputBytesPerSecond), "Transfer rate")
+                statBlock(Format.rate(session.throughputBytesPerSecond), L10n.text("Transfer rate"))
             }
             if let eta = session.etaSeconds {
-                statBlock(Format.eta(eta), "ETA")
+                statBlock(Format.eta(eta), L10n.text("ETA"))
             }
             Spacer()
             if session.workBudgetBytes > 0 {
@@ -417,19 +438,24 @@ struct TransferCardView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
+            if session.isRunning, session.pauseRequested {
+                // A pause lands at the next complete-file boundary, which on a
+                // large clip can be minutes away; say what it is waiting on.
+                Label(pausingText, systemImage: "pause.circle")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.blue)
+                    .textSelection(.enabled)
+            }
             if !session.liveFailures.isEmpty {
                 failureList
             }
             if let report = session.report, !report.issues.isEmpty {
-                transferIssueList(report.issues)
+                transferIssueList(report.issues, verified: report.status == .verified)
             }
             if let report = session.report, report.status == .verified {
-                Label(
-                    "\(report.items.count) files × \(report.destinations.count) destination\(report.destinations.count == 1 ? "" : "s") — every copy passed checksum verification.",
-                    systemImage: "checkmark.seal.fill"
-                )
-                .font(.callout)
-                .foregroundStyle(.green)
+                Label(verifiedSummary(report), systemImage: "checkmark.seal.fill")
+                    .font(.callout)
+                    .foregroundStyle(.green)
             }
             if session.report != nil, session.headline.isProblem {
                 Label("Do not erase the source media.", systemImage: "exclamationmark.triangle.fill")
@@ -458,10 +484,37 @@ struct TransferCardView: View {
         }
     }
 
+    private var pausingText: String {
+        if let current = session.progress.currentRelativePath {
+            return L10n.format(
+                "Pausing after the current file finishes · %@",
+                Format.middleTruncated(current, max: 70)
+            )
+        }
+        return L10n.text("Pausing after the current file finishes")
+    }
+
+    private func verifiedSummary(_ report: TransferReport) -> String {
+        report.destinations.count == 1
+            ? L10n.format(
+                "%lld files × 1 destination — every copy passed checksum verification.",
+                Int64(report.items.count)
+            )
+            : L10n.format(
+                "%lld files × %lld destinations — every copy passed checksum verification.",
+                Int64(report.items.count), Int64(report.destinations.count)
+            )
+    }
+
+    private var liveFailureCountText: String {
+        session.liveFailures.count == 1
+            ? L10n.text("1 failure")
+            : L10n.format("%lld failures", Int64(session.liveFailures.count))
+    }
+
     private var failureList: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label("\(session.liveFailures.count) failure\(session.liveFailures.count == 1 ? "" : "s")",
-                  systemImage: "exclamationmark.octagon.fill")
+            Label(liveFailureCountText, systemImage: "exclamationmark.octagon.fill")
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.red)
             ForEach(Array(session.liveFailures.suffix(4).enumerated()), id: \.offset) { _, failure in
@@ -476,11 +529,18 @@ struct TransferCardView: View {
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(.red.opacity(0.25)))
     }
 
-    private func transferIssueList(_ issues: [String]) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Label("Transfer-level issue", systemImage: "exclamationmark.triangle.fill")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.red)
+    /// Transfer-level issues on a verified report are warnings (orange): the
+    /// media verified, something optional or cosmetic did not. On any other
+    /// verdict they are part of why the transfer is not verified (red).
+    private func transferIssueList(_ issues: [String], verified: Bool) -> some View {
+        let tone: Color = verified ? .orange : .red
+        return VStack(alignment: .leading, spacing: 5) {
+            Label(
+                verified ? "Transfer-level warning" : "Transfer-level issue",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(tone)
             ForEach(issues, id: \.self) { issue in
                 Text(issue)
                     .font(.caption)
@@ -490,8 +550,8 @@ struct TransferCardView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
-        .background(.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.red.opacity(0.22)))
+        .background(tone.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(tone.opacity(0.22)))
     }
 
     private var actions: some View {
@@ -656,11 +716,13 @@ struct TransferCardView: View {
 
 // MARK: - Header decorations
 
-/// The little live dot: solid gray when finished, green with a soft radiating
-/// pulse while the transfer is running.
+/// The little live dot: solid when finished, with a soft radiating pulse
+/// while the transfer is running. Under Reduce Motion the pulse becomes a
+/// static halo — the colour and text carry the state, motion never does.
 struct StatusDot: View {
     let color: Color
     let active: Bool
+    var reduceMotion = false
     @State private var pulsing = false
 
     var body: some View {
@@ -671,11 +733,12 @@ struct StatusDot: View {
                 if active {
                     Circle()
                         .stroke(color.opacity(0.6), lineWidth: 1.5)
-                        .scaleEffect(pulsing ? 2.6 : 1)
-                        .opacity(pulsing ? 0 : 0.8)
+                        .scaleEffect(reduceMotion ? 1.6 : pulsing ? 2.6 : 1)
+                        .opacity(reduceMotion ? 0.5 : pulsing ? 0 : 0.8)
                 }
             }
             .onAppear {
+                guard !reduceMotion else { return }
                 withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) {
                     pulsing = true
                 }

@@ -21,13 +21,21 @@ final class TransferSession: Identifiable {
     let projectID: UUID?
     let sourceFingerprint: String?
     let allowSameVolume: Bool
-    let availableBytesByDestination: [URL: Int64]
+    /// Free bytes per output root, measured on the destination's base volume.
+    /// Captured at creation, then refreshed on a coarse heartbeat while the
+    /// transfer runs — see `ensureFreeSpaceRefresh()`.
+    private(set) var availableBytesByDestination: [URL: Int64]
     let createdAt: Date
     let sourceVolume: FileSystemVolume?
     let isRecovered: Bool
     private(set) var shortID = ""
 
-    private(set) var progress = TransferProgress(phase: .enumerating)
+    private(set) var progress = TransferProgress(phase: .enumerating) {
+        didSet {
+            recordThroughputSample()
+            ensureFreeSpaceRefresh()
+        }
+    }
     private(set) var planItemCount = 0
     private(set) var planTotalBytes: Int64 = 0
     private(set) var logEntries: [TransferLogEntry] = []
@@ -35,13 +43,22 @@ final class TransferSession: Identifiable {
     private(set) var liveFailures: [(relativePath: String, destination: URL, reason: String)] = []
     private(set) var cancelRequested = false
     private(set) var pauseRequested = false
-    private(set) var report: TransferReport?
+    private(set) var report: TransferReport? {
+        didSet { if report != nil { stopFreeSpaceRefresh() } }
+    }
     private(set) var lastLogFileURL: URL?
     private(set) var started = false
     private(set) var partialCleanupMessage: String?
     private(set) var contactSheetURL: URL?
     private(set) var contactSheetMessage: String?
     var showLog = false
+    /// Presentation only, never persisted or journaled. True while a linked
+    /// resume or repair attempt has taken this attempt's destinations over:
+    /// the operator carries on from that attempt's card, so this one must no
+    /// longer promise Resume. The attempt-lifecycle owner sets it when a
+    /// resume/repair child claims this attempt as its parent, and clears it
+    /// when that claim is released; nothing else writes it.
+    var continuedInLinkedAttempt = false
 
     /// Fired once, on the main actor, when the terminal report arrives — the
     /// queue scheduler and notifier hang off this.
@@ -58,6 +75,12 @@ final class TransferSession: Identifiable {
     private let retryManifest: TransferManifest?
     private let includedRelativePaths: Set<String>?
     private let duplicateManifests: [String: TransferManifest]
+
+    /// Recent (time, bytes) samples for the sliding-window rate — overall and
+    /// per destination. Presentation-only; never persisted.
+    private var throughputSamples: [ThroughputSample] = []
+    private var destinationThroughputSamples: [URL: [ThroughputSample]] = [:]
+    private var freeSpaceTask: Task<Void, Never>?
 
     init(
         id: UUID = UUID(),
@@ -202,9 +225,26 @@ final class TransferSession: Identifiable {
     var isActive: Bool { report == nil }
     var isQueued: Bool { !started && report == nil }
     var isRunning: Bool { started && report == nil }
-    var hasAttention: Bool {
-        !liveFailures.isEmpty || (report.map { $0.status == .failed || $0.status == .cancelled } ?? false)
+
+    /// The one definition of "needs attention" the dashboard, the filter chip,
+    /// and the sidebar footer all share: a live failure, a failed or cancelled
+    /// verdict, or a Fast-profile copy whose source still cannot be erased.
+    /// Paused is deliberate — it has its own Resume action — so it is not
+    /// attention.
+    var needsAttention: Bool {
+        Self.needsAttention(liveFailureCount: liveFailures.count, status: report?.status)
     }
+
+    nonisolated static func needsAttention(liveFailureCount: Int, status: TransferStatus?) -> Bool {
+        if liveFailureCount > 0 { return true }
+        switch status {
+        case .failed, .cancelled, .transferredPendingVerification: return true
+        case .paused, .verified, nil: return false
+        }
+    }
+
+    @available(*, deprecated, renamed: "needsAttention")
+    var hasAttention: Bool { needsAttention }
 
     var failedPairCount: Int {
         guard let report else { return 0 }
@@ -353,7 +393,13 @@ final class TransferSession: Identifiable {
     /// + one verify pass per destination).
     var overallFraction: Double {
         if let report {
-            return report.status == .verified ? 1 : lastKnownFraction
+            // Both terminal "all bytes landed" verdicts are 100% of the work
+            // this profile promised; the colour, not the number, says whether
+            // that is verified (green) or still pending read-back (yellow).
+            switch report.status {
+            case .verified, .transferredPendingVerification: return 1
+            case .failed, .cancelled, .paused: return lastKnownFraction
+            }
         }
         return lastKnownFraction
     }
@@ -361,28 +407,93 @@ final class TransferSession: Identifiable {
     private var lastKnownFraction: Double {
         let total = Double(planTotalBytes) * Double(workPassCount)
         guard total > 0 else { return 0 }
-        let done = Double(progress.preReadBytes) + Double(progress.copiedBytes) +
-            Double(progress.verifiedBytesByDestination.values.reduce(0, +))
-        return min(done / total, 1)
+        return min(Double(doneBytes) / total, 1)
     }
 
+    /// Rate over the last `ThroughputWindow.duration` seconds of progress
+    /// samples, falling back to the cumulative rate until two samples exist.
     var throughputBytesPerSecond: Double {
         guard isActive, let runStarted else { return 0 }
-        let elapsed = Date().timeIntervalSince(runStarted)
+        let now = Date()
+        if let windowed = ThroughputWindow.rate(
+            samples: throughputSamples,
+            now: now.timeIntervalSinceReferenceDate
+        ) {
+            return windowed
+        }
+        let elapsed = now.timeIntervalSince(runStarted)
         guard elapsed > 0.5 else { return 0 }
-        let done = Double(progress.preReadBytes) + Double(progress.copiedBytes) +
-            Double(progress.verifiedBytesByDestination.values.reduce(0, +))
-        return done / elapsed
+        return Double(doneBytes) / elapsed
     }
 
     var etaSeconds: Double? {
         let rate = throughputBytesPerSecond
         guard rate > 0 else { return nil }
         let total = Double(planTotalBytes) * Double(workPassCount)
-        let done = Double(progress.preReadBytes) + Double(progress.copiedBytes) +
-            Double(progress.verifiedBytesByDestination.values.reduce(0, +))
+        let done = Double(doneBytes)
         guard total > done else { return 0 }
         return (total - done) / rate
+    }
+
+    // MARK: - Throughput sampling
+
+    /// Appends one (time, bytes) sample overall and per destination whenever
+    /// a progress snapshot lands, keeping only what the window needs.
+    private func recordThroughputSample() {
+        let now = Date().timeIntervalSinceReferenceDate
+        throughputSamples = ThroughputWindow.appending(
+            ThroughputSample(time: now, bytes: doneBytes),
+            to: throughputSamples,
+            now: now
+        )
+        for destination in destinations {
+            destinationThroughputSamples[destination] = ThroughputWindow.appending(
+                ThroughputSample(time: now, bytes: destinationDoneBytes(destination)),
+                to: destinationThroughputSamples[destination] ?? [],
+                now: now
+            )
+        }
+    }
+
+    private func destinationDoneBytes(_ destination: URL) -> Int64 {
+        (progress.copiedBytesByDestination[destination] ?? 0)
+            + (progress.verifiedBytesByDestination[destination] ?? 0)
+    }
+
+    // MARK: - Live free space
+
+    /// Starts one coarse heartbeat that re-reads each destination volume's
+    /// free space off the main actor while the transfer runs. The heartbeat
+    /// ends by itself once a terminal report lands.
+    private func ensureFreeSpaceRefresh() {
+        guard freeSpaceTask == nil, isRunning else { return }
+        let pairs = Array(zip(destinations, destinationBases))
+        freeSpaceTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.freeSpaceRefreshInterval))
+                guard !Task.isCancelled, let self, self.isRunning else { return }
+                let fresh = await Self.measureFreeSpace(pairs)
+                guard !Task.isCancelled, self.isRunning else { return }
+                self.availableBytesByDestination = fresh
+            }
+        }
+    }
+
+    private func stopFreeSpaceRefresh() {
+        freeSpaceTask?.cancel()
+        freeSpaceTask = nil
+    }
+
+    private static let freeSpaceRefreshInterval: Double = 5
+
+    /// Runs on the generic executor, never the main actor: volume metadata
+    /// reads can stall on a slow or sleeping external drive.
+    private nonisolated static func measureFreeSpace(_ pairs: [(URL, URL)]) async -> [URL: Int64] {
+        let fileSystem = RealFileSystem()
+        return Dictionary(uniqueKeysWithValues: pairs.compactMap { output, base in
+            guard let free = try? fileSystem.freeSpace(at: base) else { return nil }
+            return (output, free)
+        })
     }
 
     /// Bytes finished so far across copy + verify, for the "24.7 GB of 36.2 GB" line.
@@ -414,31 +525,45 @@ final class TransferSession: Identifiable {
     /// The status line under the card title — phase-specific while running,
     /// verdict once terminal. Copy completing is never presented as success.
     var headline: (text: String, isProblem: Bool) {
-        if isQueued { return ("Queued · waiting for a slot", false) }
+        if isQueued { return (L10n.text("Queued · waiting for a slot"), false) }
         if let report {
             switch report.status {
-            case .paused: return ("Paused safely · Resume available", false)
+            case .paused:
+                return (Self.pausedHeadline(continuedInLinkedAttempt: continuedInLinkedAttempt), false)
             case .transferredPendingVerification:
-                return ("Transferred · verification pending", false)
-            case .verified: return ("Verified · Complete", false)
+                return (L10n.text("Transferred · verification pending"), false)
+            case .verified: return (L10n.text("Verified · Complete"), false)
             case .failed:
-                if isRecovered { return ("Interrupted · Review required", true) }
-                if report.failedCount > 0 {
-                    return ("Failed · \(report.failedCount) copy result\(report.failedCount == 1 ? "" : "s") failed", true)
+                if isRecovered { return (L10n.text("Interrupted · Review required"), true) }
+                if report.failedCount == 1 {
+                    return (L10n.text("Failed · 1 copy result failed"), true)
                 }
-                return ("Failed · transfer evidence incomplete", true)
-            case .cancelled: return ("Cancelled · Incomplete", true)
+                if report.failedCount > 1 {
+                    return (L10n.format("Failed · %lld copy results failed", Int64(report.failedCount)), true)
+                }
+                return (L10n.text("Failed · transfer evidence incomplete"), true)
+            case .cancelled: return (L10n.text("Cancelled · Incomplete"), true)
             }
         }
-        let percent = Int(overallFraction * 100)
+        let percent = Int64(overallFraction * 100)
         switch progress.phase {
-        case .enumerating: return ("Scanning source…", false)
-        case .preReadingSource: return ("Maximum · reading source…", false)
-        case .copying: return ("Copying · \(percent)%", false)
-        case .verifying: return ("Verifying · \(percent)%", false)
-        case .writingManifest: return ("Writing manifest…", false)
-        case .done: return ("Finishing…", false)
+        case .enumerating: return (L10n.text("Scanning source…"), false)
+        case .preReadingSource: return (L10n.text("Maximum · reading source…"), false)
+        case .copying: return (L10n.format("Copying · %lld%%", percent), false)
+        case .verifying: return (L10n.format("Verifying · %lld%%", percent), false)
+        case .writingManifest: return (L10n.text("Writing manifest…"), false)
+        case .done: return (L10n.text("Finishing…"), false)
         }
+    }
+
+    /// A paused card promises Resume only while no linked attempt has taken
+    /// it over. Once one has, a Resume here would run against files that
+    /// attempt already published, so the headline points onward instead. It
+    /// stays a non-problem headline, like the paused verdict itself.
+    nonisolated static func pausedHeadline(continuedInLinkedAttempt: Bool) -> String {
+        continuedInLinkedAttempt
+            ? L10n.text("Paused · continued in a linked attempt")
+            : L10n.text("Paused safely · Resume available")
     }
 
     // MARK: - Per-destination presentation
@@ -451,21 +576,17 @@ final class TransferSession: Identifiable {
         case paused
         case verified
         case failed
+        /// Every pair at this destination landed — verified, or under Fast
+        /// transferred and still owed a read-back — but the transfer did not
+        /// verify: its evidence or ASC MHL could not be written, the source
+        /// changed or could not be re-scanned after the copy, another
+        /// destination failed, or Cancel landed. Red, never green or yellow.
+        case transferNotVerified
     }
 
     func destinationState(_ destination: URL) -> DestinationState {
         if let report {
-            if report.status == .paused { return .paused }
-            let failures = report.items.filter {
-                if case .failed = $0.outcomes[destination] { return true } else { return false }
-            }.count
-            let verified = report.items.filter { $0.outcomes[destination]?.isVerified == true }.count
-            if failures > 0 { return .failed }
-            let pending = report.items.filter {
-                $0.outcomes[destination]?.isTransferredPendingVerification == true
-            }.count
-            if pending == report.items.count && !report.items.isEmpty { return .pendingVerification }
-            return verified == report.items.count && !report.items.isEmpty ? .verified : .failed
+            return Self.terminalDestinationState(of: report, at: destination)
         }
         switch progress.phase {
         case .enumerating, .preReadingSource: return .pending
@@ -474,15 +595,53 @@ final class TransferSession: Identifiable {
         }
     }
 
+    /// One destination's terminal tile state, from the report alone. Green
+    /// needs all three: every pair here verified, the transfer's own verdict
+    /// verified, and this destination among the places its evidence landed.
+    /// Fast's yellow has the same shape: every pair here landed, a
+    /// transferred-pending-verification verdict, and evidence here. The
+    /// engine fails or cancels a run without touching any pair's outcome
+    /// (evidence or MHL write failure, post-copy source re-scan veto, Cancel
+    /// while finalizing, a failure at another destination), so outcomes alone
+    /// never earn green or yellow.
+    nonisolated static func terminalDestinationState(
+        of report: TransferReport,
+        at destination: URL
+    ) -> DestinationState {
+        if report.status == .paused { return .paused }
+        let outcomes = report.items.map { $0.outcomes[destination] }
+        // Landed: read back and matched, or (Fast) copied and still owed a
+        // read-back. Anything else is this destination's own failure.
+        let everyPairLanded = !outcomes.isEmpty && outcomes.allSatisfy {
+            $0?.isVerified == true || $0?.isTransferredPendingVerification == true
+        }
+        guard everyPairLanded else { return .failed }
+        let hasEvidence = report.manifestLocations.contains(destination)
+        switch report.status {
+        case .verified:
+            let everyPairVerified = outcomes.allSatisfy { $0?.isVerified == true }
+            return everyPairVerified && hasEvidence ? .verified : .transferNotVerified
+        case .transferredPendingVerification:
+            return hasEvidence ? .pendingVerification : .transferNotVerified
+        case .failed, .cancelled, .paused:
+            return .transferNotVerified
+        }
+    }
+
+    /// The red `transferNotVerified` text says what did happen here: every
+    /// copy was read back and matched, or (Fast) copies landed that nobody
+    /// read back. Neither wording is the success one.
+    nonisolated static func transferNotVerifiedText(of report: TransferReport, at destination: URL) -> String {
+        let everyPairVerified = !report.items.isEmpty
+            && report.items.allSatisfy { $0.outcomes[destination]?.isVerified == true }
+        return everyPairVerified
+            ? L10n.text("Copies verified · transfer not verified")
+            : L10n.text("Transferred · transfer not verified")
+    }
+
     func destinationFraction(_ destination: URL) -> Double {
         if let report {
-            guard planTotalBytes > 0 || !report.items.isEmpty else { return 0 }
-            let total = report.items.reduce(Int64(0)) { $0 + $1.item.size }
-            guard total > 0 else { return 0 }
-            let verified = report.items.reduce(Int64(0)) { value, item in
-                value + (item.outcomes[destination]?.isVerified == true ? item.item.size : 0)
-            }
-            return min(Double(verified) / Double(total), 1)
+            return Self.reportedFraction(of: report, at: destination)
         }
         switch progress.phase {
         case .enumerating:
@@ -498,13 +657,38 @@ final class TransferSession: Identifiable {
         }
     }
 
+    /// The terminal per-destination fraction. Both verified and
+    /// transferred-pending-verification bytes have landed, so both count —
+    /// the yellow state, not the number, says verification is still owed.
+    /// A destination with any failure keeps its shape: verified bytes only.
+    nonisolated static func reportedFraction(of report: TransferReport, at destination: URL) -> Double {
+        let total = report.items.reduce(Int64(0)) { $0 + $1.item.size }
+        guard total > 0 else { return 0 }
+        let hasFailure = report.items.contains {
+            if case .failed = $0.outcomes[destination] { return true } else { return false }
+        }
+        let landed = report.items.reduce(Int64(0)) { value, item in
+            guard let outcome = item.outcomes[destination] else { return value }
+            if outcome.isVerified { return value + item.item.size }
+            if !hasFailure, outcome.isTransferredPendingVerification { return value + item.item.size }
+            return value
+        }
+        return min(Double(landed) / Double(total), 1)
+    }
+
+    /// Windowed like the overall rate, with the same cumulative fallback.
     func destinationThroughput(_ destination: URL) -> Double {
         guard isRunning, let runStarted else { return 0 }
-        let elapsed = Date().timeIntervalSince(runStarted)
+        let now = Date()
+        if let windowed = ThroughputWindow.rate(
+            samples: destinationThroughputSamples[destination] ?? [],
+            now: now.timeIntervalSinceReferenceDate
+        ) {
+            return windowed
+        }
+        let elapsed = now.timeIntervalSince(runStarted)
         guard elapsed > 0.5 else { return 0 }
-        let bytes = (progress.copiedBytesByDestination[destination] ?? 0)
-            + (progress.verifiedBytesByDestination[destination] ?? 0)
-        return Double(bytes) / elapsed
+        return Double(destinationDoneBytes(destination)) / elapsed
     }
 
     func destinationETA(_ destination: URL) -> Double? {
@@ -512,9 +696,7 @@ final class TransferSession: Identifiable {
         guard rate > 0 else { return nil }
         let passes: Int64 = verificationProfile == .fast ? 1 : 2
         let total = planTotalBytes * passes
-        let done = (progress.copiedBytesByDestination[destination] ?? 0)
-            + (progress.verifiedBytesByDestination[destination] ?? 0)
-        return max(Double(total - done) / rate, 0)
+        return max(Double(total - destinationDoneBytes(destination)) / rate, 0)
     }
 
     func isBottleneck(_ destination: URL) -> Bool {
@@ -543,6 +725,9 @@ final class TransferSession: Identifiable {
         case .pendingVerification: return L10n.text("Transferred · verification pending")
         case .paused: return L10n.text("Paused · completed files retained")
         case .verified: return L10n.format("Verified · %@", errorText)
+        case .transferNotVerified:
+            // Only a terminal report produces this state.
+            return report.map { Self.transferNotVerifiedText(of: $0, at: destination) } ?? L10n.text("Incomplete")
         case .failed:
             return errors > 0 ? L10n.format("Failed · %@", errorText) : L10n.text("Incomplete")
         }
@@ -617,5 +802,64 @@ final class TransferSession: Identifiable {
         return base
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "com.lucastao.doppelganger", isDirectory: true)
             .appendingPathComponent("Transfers", isDirectory: true)
+    }
+}
+
+// MARK: - Sliding-window throughput
+
+/// One progress observation: seconds since the reference date, and the bytes
+/// finished at that moment.
+struct ThroughputSample: Equatable, Sendable {
+    let time: TimeInterval
+    let bytes: Int64
+}
+
+/// Pure arithmetic for a rate over the most recent few seconds of samples,
+/// so a display rate answers "how fast right now" rather than "how fast on
+/// average since launch".
+enum ThroughputWindow {
+    /// How far back the rate looks.
+    static let duration: TimeInterval = 5
+    /// Hard cap on retained samples; progress is throttled well below this
+    /// over a 5 s window, so the cap is only a guard.
+    static let maxSamples = 128
+
+    /// Bytes per second over the window ending at `now`, or `nil` when fewer
+    /// than two samples span a positive interval — callers fall back to the
+    /// cumulative rate then. The reference point is the newest sample at or
+    /// before `now - window`, or the oldest sample when none is that old, so
+    /// a young transfer still measures over everything it has.
+    static func rate(
+        samples: [ThroughputSample],
+        now: TimeInterval,
+        window: TimeInterval = duration
+    ) -> Double? {
+        guard samples.count >= 2, let latest = samples.last else { return nil }
+        let cutoff = now - window
+        let reference = samples.dropLast().last(where: { $0.time <= cutoff }) ?? samples[0]
+        guard reference.time < latest.time else { return nil }
+        let elapsed = max(now, latest.time) - reference.time
+        let delta = latest.bytes - reference.bytes
+        return max(Double(delta) / elapsed, 0)
+    }
+
+    /// Appends `sample` and prunes to what `rate` needs: everything inside
+    /// the window plus the single newest sample older than it.
+    static func appending(
+        _ sample: ThroughputSample,
+        to samples: [ThroughputSample],
+        now: TimeInterval,
+        window: TimeInterval = duration
+    ) -> [ThroughputSample] {
+        var kept = samples
+        kept.append(sample)
+        let cutoff = now - window
+        if let referenceIndex = kept.lastIndex(where: { $0.time <= cutoff }), referenceIndex > 0 {
+            kept.removeFirst(referenceIndex)
+        }
+        if kept.count > maxSamples {
+            kept.removeFirst(kept.count - maxSamples)
+        }
+        return kept
     }
 }

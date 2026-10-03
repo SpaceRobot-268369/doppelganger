@@ -19,6 +19,9 @@ struct PreflightResultView: View {
         VStack(alignment: .leading, spacing: 10) {
             headline
             destinationRows
+            if !priorVerifiedTasks.isEmpty {
+                priorVerifiedWarning
+            }
             ForEach(result.blockingIssues, id: \.self) { issue in
                 Label(issue, systemImage: "xmark.octagon.fill")
                     .font(.callout)
@@ -86,7 +89,7 @@ struct PreflightResultView: View {
                     .lineLimit(1)
             }
             Spacer()
-            Text("\(result.itemCount) files · \(Format.bytes(result.totalBytes))")
+            Text(L10n.format("%lld files · %@", Int64(result.itemCount), Format.bytes(result.totalBytes)))
                 .font(.callout)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
@@ -158,9 +161,13 @@ struct PreflightResultView: View {
                     )
                     .font(.callout.weight(.semibold))
                 }
-                Text("\(result.mediaAnalysis.mediaFileCount) recognized media · \(result.mediaAnalysis.sidecarFileCount) sidecars")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(L10n.format(
+                    "%lld recognized media · %lld sidecars",
+                    Int64(result.mediaAnalysis.mediaFileCount),
+                    Int64(result.mediaAnalysis.sidecarFileCount)
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 ForEach(result.mediaAnalysis.clips.prefix(3)) { clip in
                     let facts = [
                         clip.codec,
@@ -227,6 +234,33 @@ struct PreflightResultView: View {
 
     // MARK: - Source history
 
+    /// Re-offloading a card that already verified is the most common operator
+    /// mistake, so the match sits at verdict level in orange — a warning that
+    /// needs no acknowledgement, never a blocker, and never a digest skip.
+    private var priorVerifiedWarning: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(priorVerifiedTasks.prefix(2)) { task in
+                Label(priorVerifiedText(task), systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .help(task.destinationPaths.joined(separator: "\n"))
+            }
+        }
+    }
+
+    private func priorVerifiedText(_ task: TaskHistoryRecord) -> String {
+        L10n.format(
+            "This exact source plan was verified before · %@ → %@",
+            task.createdAt.formatted(date: .abbreviated, time: .shortened),
+            task.destinationPaths
+                .map { URL(fileURLWithPath: $0).lastPathComponent }
+                .joined(separator: " + ")
+        )
+    }
+
     private var hasHistory: Bool {
         !priorVerifiedTasks.isEmpty || !changedPriorTasks.isEmpty || !similarPriorTasks.isEmpty
     }
@@ -277,7 +311,7 @@ struct PreflightResultView: View {
             disclosureLabel(
                 "Previously seen",
                 systemImage: "clock.arrow.circlepath",
-                flagged: !changedPriorTasks.isEmpty
+                flagged: !priorVerifiedTasks.isEmpty || !changedPriorTasks.isEmpty
             )
         }
     }

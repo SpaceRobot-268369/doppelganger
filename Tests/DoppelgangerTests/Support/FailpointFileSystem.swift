@@ -14,6 +14,7 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
     private var corruptOnWriteSuffixes: Set<String> = []
     private var noSpaceBudgets: [String: Int] = [:]        // root path → writable bytes before ENOSPC
     private var goneRoots: Set<String> = []                // everything under these fails volumeGone
+    private var listingBudgets: [String: Int] = [:]        // root path → listings of it before enumerate fails volumeGone
     private var goneAfterReadBudgets: [String: Int] = [:]  // root path → readable bytes before the volume "vanishes"
     private var goneAfterWriteBudgets: [String: Int] = [:] // root path → writable bytes before the volume "vanishes"
     private var unreadableSuffixes: Set<String> = []
@@ -56,6 +57,14 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
     /// `fileExists` under it reports false — an unmounted volume.
     func markVolumeGone(_ root: URL) {
         withLock { _ = goneRoots.insert(root.path) }
+    }
+
+    /// The first `count` listings of exactly `root` succeed; every later one
+    /// throws `.volumeGone` — a card pulled after the engine planned from it,
+    /// which only the post-copy source re-scan notices. Reads, writes, and
+    /// metadata under `root` are unaffected.
+    func failListings(of root: URL, after count: Int) {
+        withLock { listingBudgets[root.path] = count }
     }
 
     /// The volume at `root` "vanishes" after `bytes` have been read under it.
@@ -130,6 +139,11 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
 
     func enumerate(root: URL) throws -> [SourceItem] {
         if isGone(root.path) { throw FileSystemError.volumeGone }
+        try withLock {
+            guard let remaining = listingBudgets[root.path] else { return }
+            if remaining <= 0 { throw FileSystemError.volumeGone }
+            listingBudgets[root.path] = remaining - 1
+        }
         return try base.enumerate(root: root)
     }
 
