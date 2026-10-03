@@ -4,8 +4,8 @@ import SwiftUI
 // source→destination connector while bytes move, and every destination tile
 // carries a mosaic in which each cell is an equal slice of the plan's bytes.
 // Colour follows the product semantics: blue copying, cyan read-back
-// verification, yellow Fast pending, red failed, and green only once the
-// whole transfer verified. Motion means bytes moved moments ago, never
+// verification, yellow Fast pending, red failed, and green only where the
+// destination's tile says verified. Motion means bytes moved moments ago, never
 // success: it stops at a terminal state, on a destination with nothing left to
 // do, and during a stall; Reduce Motion replaces it with still pixels.
 
@@ -25,13 +25,15 @@ enum PixelPass: Sendable {
 enum PixelCell: Int, Comparable, Sendable {
     /// The destination verified end to end in a verified transfer.
     case confirmed
-    /// This file verified, but the transfer as a whole did not.
+    /// This file verified, but its destination's tile did not.
     case verifiedFile
     /// Read back and matched while the run is still live.
     case readBack
-    /// Written, not yet read back.
+    /// Written, not yet read back: live, or a Fast copy under a tile that
+    /// failed or did not verify.
     case copied
-    /// Fast profile: transferred, never read back.
+    /// Fast profile: transferred, never read back, under a tile that says
+    /// verification is pending (or a paused one that will carry the copy on).
     case pendingVerification
     /// Not reached, skipped, or never attempted.
     case empty
@@ -106,9 +108,11 @@ struct PixelMosaicSnapshot: Equatable, Sendable {
 
     /// The exact picture of a finished run: each item covers its share of the
     /// plan's bytes, in plan order, with its outcome at this destination.
+    /// `state` is the destination tile's own terminal state, so the pixels
+    /// never claim more than its text and symbol do.
     static func terminal(
         items: [(size: Int64, outcome: ItemDestinationOutcome?)],
-        transferVerified: Bool
+        state: TransferSession.DestinationState
     ) -> PixelMosaicSnapshot {
         let total = items.reduce(Int64(0)) { $0 + max($1.size, 0) }
         // An all-empty plan still gets one equal slice per item.
@@ -119,7 +123,7 @@ struct PixelMosaicSnapshot: Equatable, Sendable {
         var position = 0.0
         for item in items {
             let end = min(position + weight(item.size), 1)
-            let cell = cell(for: item.outcome, transferVerified: transferVerified)
+            let cell = cell(for: item.outcome, state: state)
             if let last = spans.last, last.cell == cell, last.end == position, last.end > last.start {
                 spans[spans.count - 1].end = end
             } else {
@@ -182,10 +186,18 @@ struct PixelMosaicSnapshot: Equatable, Sendable {
         head != nil && PixelActivityLog.isRecent(headLastAdvance, at: date)
     }
 
-    private static func cell(for outcome: ItemDestinationOutcome?, transferVerified: Bool) -> PixelCell {
+    /// Green only on a verified tile. Yellow only where the tile says
+    /// verification is pending, or on a paused tile whose Fast copies its
+    /// resume carries forward. Under a failed or not-verified tile a Fast copy
+    /// landed and nobody read it back: written, never "pending".
+    private static func cell(
+        for outcome: ItemDestinationOutcome?,
+        state: TransferSession.DestinationState
+    ) -> PixelCell {
         switch outcome {
-        case .verified, .verifiedDuplicate: transferVerified ? .confirmed : .verifiedFile
-        case .transferredPendingVerification: .pendingVerification
+        case .verified, .verifiedDuplicate: state == .verified ? .confirmed : .verifiedFile
+        case .transferredPendingVerification:
+            state == .pendingVerification || state == .paused ? .pendingVerification : .copied
         case .failed: .failed
         case .skipped, nil: .empty
         }

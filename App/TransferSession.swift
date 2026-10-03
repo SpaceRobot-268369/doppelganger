@@ -913,15 +913,28 @@ final class TransferSession: Identifiable {
         }
     }
 
+    /// The collapsed strip's colour for the current phase. Blue claims bytes
+    /// written to the destinations, so Maximum's source pre-read, which
+    /// writes nothing yet, reads as cyan like the other read-and-hash pass;
+    /// Fast's verifying phase compares metadata only, so it never turns cyan.
+    var pixelStripCell: PixelCell {
+        Self.pixelStripCell(phase: progress.phase, profile: verificationProfile)
+    }
+
+    nonisolated static func pixelStripCell(phase: TransferPhase, profile: VerificationProfile) -> PixelCell {
+        switch phase {
+        case .preReadingSource: .readBack
+        case .verifying: profile == .fast ? .copied : .readBack
+        default: .copied
+        }
+    }
+
     /// One destination tile's mosaic: the live byte counters as a fill, with
     /// failures where they happened, then the report's exact per-file map
     /// once terminal.
     func pixelMosaic(for destination: URL) -> PixelMosaicSnapshot {
         if let report {
-            return .terminal(
-                items: report.items.map { ($0.item.size, $0.outcomes[destination]) },
-                transferVerified: report.status == .verified
-            )
+            return Self.terminalPixelMosaic(of: report, at: destination)
         }
         guard isRunning else { return .empty }
         if planItemCount > 0, (pixelActivity.failureCounts[destination] ?? 0) >= planItemCount {
@@ -933,6 +946,19 @@ final class TransferSession: Identifiable {
             pass: pixelPass,
             failureMarks: pixelActivity.failureMarks[destination] ?? [],
             lastAdvance: pixelPass.flatMap { pixelActivity.lastAdvance(destination, pass: $0) }
+        )
+    }
+
+    /// The report's per-file map at one destination, keyed on the same
+    /// `terminalDestinationState` as the tile's text and symbol: a failed Fast
+    /// tile is never yellow under red text, and green needs a verified tile.
+    nonisolated static func terminalPixelMosaic(
+        of report: TransferReport,
+        at destination: URL
+    ) -> PixelMosaicSnapshot {
+        .terminal(
+            items: report.items.map { ($0.item.size, $0.outcomes[destination]) },
+            state: terminalDestinationState(of: report, at: destination)
         )
     }
 

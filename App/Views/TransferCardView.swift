@@ -77,7 +77,7 @@ struct TransferCardView: View {
             if session.isActive {
                 PixelProgressStrip(
                     fraction: session.overallFraction,
-                    cell: session.progress.phase == .verifying ? .readBack : .copied,
+                    cell: session.pixelStripCell,
                     live: session.pixelPass != nil,
                     lastAdvance: session.pixelLastAdvance
                 )

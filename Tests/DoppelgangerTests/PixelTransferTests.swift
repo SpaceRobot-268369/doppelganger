@@ -8,7 +8,7 @@ struct PixelMosaicTests {
     @Test func verifiedTransferIsGreenEndToEnd() {
         let snapshot = PixelMosaicSnapshot.terminal(
             items: [(100, .verified), (300, .verifiedDuplicate), (600, .verified)],
-            transferVerified: true
+            state: .verified
         )
         #expect(snapshot.cells(count: 40).allSatisfy { $0 == .confirmed })
         #expect(snapshot.head == nil)
@@ -22,7 +22,7 @@ struct PixelMosaicTests {
         let snapshot = PixelMosaicSnapshot.terminal(
             items: [(4_530_000_000, .verified), (1, .failed(.checksumMismatch(expected: "a", actual: "b"))),
                     (10 * gigabyte - 4_530_000_000, .verified)],
-            transferVerified: false
+            state: .failed
         )
         let cells = snapshot.cells(count: 100)
         #expect(cells.filter { $0 == .failed }.count == 1)
@@ -34,13 +34,13 @@ struct PixelMosaicTests {
         // First item of a huge plan: starts exactly on boundary 0.
         let first = PixelMosaicSnapshot.terminal(
             items: [(1, .failed(.destinationFull)), (300_000_000_000, .verified)],
-            transferVerified: false
+            state: .failed
         )
         #expect(first.cells(count: 240)[0] == .failed)
         // Centred on boundary k/n.
         let middle = PixelMosaicSnapshot.terminal(
             items: [(150_000_000_000, .verified), (2, .failed(.destinationFull)), (150_000_000_000, .verified)],
-            transferVerified: false
+            state: .failed
         )
         #expect(middle.cells(count: 240).filter { $0 == .failed }.count == 1)
     }
@@ -48,7 +48,7 @@ struct PixelMosaicTests {
     @Test func verifiedFilesInAFailedTransferAreNotConfirmed() {
         let snapshot = PixelMosaicSnapshot.terminal(
             items: [(50, .verified), (50, .failed(.destinationFull))],
-            transferVerified: false
+            state: .failed
         )
         let cells = snapshot.cells(count: 10)
         #expect(cells[0..<5].allSatisfy { $0 == .verifiedFile })
@@ -58,7 +58,7 @@ struct PixelMosaicTests {
     @Test func fastProfileShowsPendingVerification() {
         let snapshot = PixelMosaicSnapshot.terminal(
             items: [(10, .transferredPendingVerification), (10, .transferredPendingVerification)],
-            transferVerified: false
+            state: .pendingVerification
         )
         #expect(snapshot.cells(count: 8).allSatisfy { $0 == .pendingVerification })
     }
@@ -66,7 +66,7 @@ struct PixelMosaicTests {
     @Test func skippedAndMissingOutcomesAreEmpty() {
         let snapshot = PixelMosaicSnapshot.terminal(
             items: [(50, .verified), (25, .skipped(.paused)), (25, nil)],
-            transferVerified: false
+            state: .paused
         )
         let cells = snapshot.cells(count: 4)
         #expect(cells == [.verifiedFile, .verifiedFile, .empty, .empty])
@@ -75,7 +75,7 @@ struct PixelMosaicTests {
     @Test func zeroWidthSpanStillOwnsACell() {
         let snapshot = PixelMosaicSnapshot.terminal(
             items: [(100, .verified), (0, .failed(.missingFile)), (100, .verified)],
-            transferVerified: false
+            state: .failed
         )
         #expect(snapshot.cells(count: 20).filter { $0 == .failed }.count == 1)
     }
@@ -83,13 +83,13 @@ struct PixelMosaicTests {
     @Test func emptyPlanWeightsItemsEqually() {
         let snapshot = PixelMosaicSnapshot.terminal(
             items: [(0, .verified), (0, .failed(.missingFile))],
-            transferVerified: false
+            state: .failed
         )
         #expect(snapshot.cells(count: 4) == [.verifiedFile, .verifiedFile, .failed, .failed])
     }
 
     @Test func interruptedRunWithNoItemsIsAllEmpty() {
-        let snapshot = PixelMosaicSnapshot.terminal(items: [], transferVerified: false)
+        let snapshot = PixelMosaicSnapshot.terminal(items: [], state: .failed)
         #expect(snapshot.cells(count: 12).allSatisfy { $0 == .empty })
     }
 
@@ -97,7 +97,7 @@ struct PixelMosaicTests {
         // 0.55 of the bytes verified, the rest failed: the shared cell is red.
         let snapshot = PixelMosaicSnapshot.terminal(
             items: [(55, .verified), (45, .failed(.destinationUnmounted))],
-            transferVerified: false
+            state: .failed
         )
         let cells = snapshot.cells(count: 10)
         #expect(cells[5] == .failed)
@@ -109,7 +109,7 @@ struct PixelMosaicTests {
             (Int64(1 + index % 7), index == 12_345
                 ? ItemDestinationOutcome.failed(.checksumMismatch(expected: "x", actual: "y")) : .verified)
         }
-        let cells = PixelMosaicSnapshot.terminal(items: items, transferVerified: false).cells(count: 300)
+        let cells = PixelMosaicSnapshot.terminal(items: items, state: .failed).cells(count: 300)
         #expect(cells.count == 300)
         #expect(cells.filter { $0 == .failed }.count == 1)
     }
@@ -183,9 +183,203 @@ struct PixelMosaicTests {
             .allSatisfy { $0 == .empty })
     }
 
+    @Test func progressStripIsBlueOnlyWhileBytesAreWritten() {
+        #expect(TransferSession.pixelStripCell(phase: .preReadingSource, profile: .maximum) == .readBack,
+                "the source pre-read has written nothing yet")
+        #expect(TransferSession.pixelStripCell(phase: .copying, profile: .maximum) == .copied)
+        #expect(TransferSession.pixelStripCell(phase: .verifying, profile: .standard) == .readBack)
+        #expect(TransferSession.pixelStripCell(phase: .verifying, profile: .fast) == .copied,
+                "Fast compares metadata and reads nothing back")
+    }
+
     @Test func severityRanking() {
         let ranked: [PixelCell] = [.confirmed, .verifiedFile, .readBack, .copied, .pendingVerification, .empty, .failed]
         #expect(ranked == ranked.sorted())
+    }
+}
+
+/// The terminal mosaic is keyed on `TransferSession.terminalDestinationState`,
+/// the state behind the tile's text and symbol, so its pixels never claim more
+/// than the tile does: green only on a verified tile, yellow only where
+/// verification is genuinely pending or a paused Fast attempt holds copies its
+/// resume carries forward. No running `TransferSession` is constructed: its
+/// init writes a journal under Application Support. A restored card is built
+/// the way the app restores one, which never saves.
+struct PixelTerminalTileTests {
+    private static let destinationA = ReportFixtures.destinationA
+    private static let destinationB = ReportFixtures.destinationB
+    private static let spool = URL(fileURLWithPath: "/Volumes/Spool/aaaaaaaa", isDirectory: true)
+    private static let pending = ItemDestinationOutcome.transferredPendingVerification
+    private static let full = ItemDestinationOutcome.failed(.destinationFull)
+
+    /// One 100-byte item per index; `a[i]` and `b[i]` are its outcomes.
+    /// Evidence lands at both destinations and the spool unless stated.
+    private static func report(
+        _ status: TransferStatus,
+        profile: VerificationProfile = .fast,
+        a: [ItemDestinationOutcome],
+        b: [ItemDestinationOutcome],
+        evidenceAt manifestLocations: [URL]? = nil
+    ) -> TransferReport {
+        precondition(a.count == b.count, "one outcome per item at each destination")
+        return TransferReport(
+            id: ReportFixtures.transferID,
+            status: status,
+            algorithm: .xxh3,
+            verificationProfile: profile,
+            sourceRoot: ReportFixtures.source,
+            destinations: [destinationA, destinationB],
+            startedAt: ReportFixtures.started,
+            finishedAt: ReportFixtures.finished,
+            items: zip(a, b).enumerated().map { index, pair in
+                ItemResult(
+                    item: SourceItem(relativePath: "CLIP\(index).MOV", size: 100),
+                    sourceDigest: "00",
+                    outcomes: [destinationA: pair.0, destinationB: pair.1]
+                )
+            },
+            manifestLocations: manifestLocations ?? [destinationA, destinationB, spool]
+        )
+    }
+
+    private static func state(_ report: TransferReport, at destination: URL) -> TransferSession.DestinationState {
+        TransferSession.terminalDestinationState(of: report, at: destination)
+    }
+
+    /// Twenty cells: with two equal items, ten per item.
+    private static func cells(_ report: TransferReport, at destination: URL) -> [PixelCell] {
+        TransferSession.terminalPixelMosaic(of: report, at: destination).cells(count: 20)
+    }
+
+    private static func halves(_ first: PixelCell, _ second: PixelCell) -> [PixelCell] {
+        Array(repeating: first, count: 10) + Array(repeating: second, count: 10)
+    }
+
+    @Test func fastCopiesAreYellowOnlyWhereTheTileSaysPending() {
+        // Evidence write failure, source re-scan veto, or Cancel while
+        // finalizing: every Fast copy landed, and the tile is red.
+        for status in [TransferStatus.failed, .cancelled] {
+            let report = Self.report(status, a: [Self.pending, Self.pending], b: [Self.pending, Self.pending])
+            #expect(Self.state(report, at: Self.destinationA) == .transferNotVerified)
+            #expect(Self.cells(report, at: Self.destinationA) == Self.halves(.copied, .copied), "\(status)")
+        }
+        // A destination whose own copy failed keeps its failure in place and
+        // shows its landed copies unread.
+        let ownFailure = Self.report(.failed, a: [Self.pending, Self.pending], b: [Self.pending, Self.full])
+        #expect(Self.state(ownFailure, at: Self.destinationB) == .failed)
+        #expect(Self.cells(ownFailure, at: Self.destinationB) == Self.halves(.copied, .failed))
+        // The same copies under a genuinely pending verdict stay yellow.
+        let genuine = Self.report(.transferredPendingVerification,
+                                  a: [Self.pending, Self.pending], b: [.verifiedDuplicate, Self.pending])
+        #expect(Self.cells(genuine, at: Self.destinationA) == Self.halves(.pendingVerification, .pendingVerification))
+        #expect(Self.cells(genuine, at: Self.destinationB) == Self.halves(.verifiedFile, .pendingVerification))
+        // A paused Fast attempt holds copies its resume carries forward.
+        let paused = Self.report(.paused, a: [Self.pending, .skipped(.paused)], b: [Self.pending, .skipped(.paused)])
+        #expect(Self.cells(paused, at: Self.destinationA) == Self.halves(.pendingVerification, .empty))
+    }
+
+    @Test func greenNeedsTheTileToSayVerified() {
+        // Every copy verified, but the evidence never landed on B.
+        let report = Self.report(.verified, profile: .standard,
+                                 a: [.verified, .verifiedDuplicate], b: [.verified, .verified],
+                                 evidenceAt: [Self.destinationA, Self.spool])
+        #expect(Self.cells(report, at: Self.destinationA) == Self.halves(.confirmed, .confirmed))
+        #expect(Self.state(report, at: Self.destinationB) == .transferNotVerified)
+        #expect(Self.cells(report, at: Self.destinationB) == Self.halves(.verifiedFile, .verifiedFile))
+        // A refused MHL generation fails a run whose every copy verified.
+        let failed = Self.report(.failed, profile: .standard, a: [.verified, .verified], b: [.verified, .verified])
+        #expect(Self.cells(failed, at: Self.destinationA) == Self.halves(.verifiedFile, .verifiedFile))
+    }
+
+    /// The fail-closed invariant over every verdict, outcome mix and evidence
+    /// placement: a confirmed cell needs a verified tile, a pending cell needs
+    /// a pending or paused tile, and those tiles show every copy still owed a
+    /// read-back as pending.
+    @Test func terminalCellsNeverClaimMoreThanTheTile() {
+        let outcomeSets: [[ItemDestinationOutcome]] = [
+            [],
+            [Self.pending, Self.pending],
+            [.verifiedDuplicate, Self.pending],
+            [.verified, .verified],
+            [.verified, .verifiedDuplicate],
+            [Self.pending, .skipped(.cancelled)],
+            [Self.pending, .skipped(.paused)],
+            [Self.pending, Self.full],
+            [.verified, Self.full],
+        ]
+        let evidence: [[URL]] = [[Self.destinationA, Self.destinationB, Self.spool], [Self.spool], []]
+        let statuses: [TransferStatus] = [.failed, .cancelled, .paused, .verified, .transferredPendingVerification]
+        for status in statuses {
+            for outcomes in outcomeSets {
+                for locations in evidence {
+                    let report = Self.report(status, a: outcomes, b: outcomes, evidenceAt: locations)
+                    for destination in [Self.destinationA, Self.destinationB] {
+                        let state = Self.state(report, at: destination)
+                        let cells = Self.cells(report, at: destination)
+                        let context = "\(status) · \(outcomes) · evidence at "
+                            + "\(locations.map(\.lastPathComponent)) · \(state)"
+                        #expect(!cells.contains(.confirmed) || state == .verified, "\(context)")
+                        #expect(!cells.contains(.pendingVerification)
+                            || state == .pendingVerification || state == .paused, "\(context)")
+                        if state == .verified {
+                            #expect(cells.allSatisfy { $0 == .confirmed }, "\(context)")
+                        }
+                        if state == .pendingVerification || state == .paused {
+                            #expect(cells.contains(.pendingVerification) == outcomes.contains(Self.pending),
+                                    "\(context)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A paused or Fast-pending attempt offered again after relaunch has its
+    /// report and no engine behind it: no pass, no motion, and a mosaic keyed
+    /// on its tile like any finished card.
+    @MainActor
+    @Test func aRestoredCardIsStillAndKeyedOnItsTile() {
+        let paused = Self.report(.paused, a: [Self.pending, .skipped(.paused)], b: [Self.pending, .skipped(.paused)])
+        // Defensive: a pending verdict whose evidence missed B.
+        let pending = Self.report(.transferredPendingVerification,
+                                  a: [Self.pending, Self.pending], b: [Self.pending, Self.pending],
+                                  evidenceAt: [Self.destinationA, Self.spool])
+        var restored: [TransferSession] = []
+        for (report, status) in [(paused, TransferJournal.Status.paused), (pending, .transferredPendingVerification)] {
+            let session = TransferSession(restoring: RestorableAttempt(
+                journal: TransferJournal(
+                    id: report.id,
+                    label: "20261002_A001",
+                    source: ReportFixtures.source,
+                    destinationBases: [Self.destinationA, Self.destinationB],
+                    destinations: [Self.destinationA, Self.destinationB],
+                    algorithm: .xxh3,
+                    verificationProfile: .fast,
+                    allowSameVolume: true,
+                    createdAt: ReportFixtures.started,
+                    startedAt: ReportFixtures.started,
+                    itemCount: report.items.count,
+                    totalBytes: report.totalBytes,
+                    status: status
+                ),
+                report: report
+            ))
+            #expect(session.pixelPass == nil)
+            #expect(session.pixelLastAdvance == nil)
+            #expect(session.pixelFlows() == [.idle, .idle])
+            for destination in [Self.destinationA, Self.destinationB] {
+                let mosaic = session.pixelMosaic(for: destination)
+                #expect(mosaic == TransferSession.terminalPixelMosaic(of: report, at: destination))
+                #expect(mosaic.head == nil)
+                #expect(!mosaic.cells(count: 20).contains(.confirmed))
+            }
+            restored.append(session)
+        }
+        #expect(restored[0].pixelMosaic(for: Self.destinationA).cells(count: 20)
+            == Self.halves(.pendingVerification, .empty))
+        #expect(restored[1].pixelMosaic(for: Self.destinationA).cells(count: 20)
+            == Self.halves(.pendingVerification, .pendingVerification))
+        #expect(restored[1].pixelMosaic(for: Self.destinationB).cells(count: 20) == Self.halves(.copied, .copied))
     }
 }
 
