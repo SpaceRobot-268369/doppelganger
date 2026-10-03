@@ -363,6 +363,14 @@ final class TransferSession: Identifiable {
         case .log(let entry):
             logEntries.append(entry)
             logStore?.append(entry)
+        case .mhlGenerationWritten(let destination, let generationURL, let chainURL, let archiveURL):
+            journal.mhlGenerations = (journal.mhlGenerations ?? []) + [MHLGenerationRecord(
+                destination: destination,
+                generationURL: generationURL,
+                chainURL: chainURL,
+                archiveURL: archiveURL
+            )]
+            journalStore.save(journal)
         case .finished(let finished):
             logStore?.close()
             logStore = nil
@@ -490,7 +498,8 @@ final class TransferSession: Identifiable {
 
     /// Bytes finished so far across copy + verify, for the "24.7 GB of 36.2 GB" line.
     var doneBytes: Int64 {
-        progress.copiedBytes + progress.verifiedBytesByDestination.values.reduce(0, +)
+        progress.preReadBytes + progress.copiedBytes
+            + progress.verifiedBytesByDestination.values.reduce(0, +)
     }
 
     var workBudgetBytes: Int64 {

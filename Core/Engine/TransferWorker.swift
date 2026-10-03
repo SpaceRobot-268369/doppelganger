@@ -40,6 +40,12 @@ struct TransferWorker {
     /// zero items must not read as a vacuous success.
     private var vetoed = false
     private var transferIssues: [String] = []
+    /// Prefix of an advisory transfer issue: reported, but never a reason the
+    /// run is not verified. The catalog task rollup reads it as neutral.
+    static let warningIssuePrefix = "Warning: "
+    /// Fix-up bookkeeping for destinations whose filesystem refused to
+    /// preserve source timestamps: destination → (first issue index, count).
+    private var timestampWarnings: [URL: (issueIndex: Int, count: Int)] = [:]
     private let startedAt = Date()
 
     init(
@@ -74,12 +80,13 @@ struct TransferWorker {
             items = try fileSystem.enumerate(root: request.sourceRoot)
         } catch {
             sourceDead = true
+            transferIssues.append("The source could not be scanned: \(describe(error))")
             await hub.log(.error, "Could not enumerate source: \(describe(error))")
             await finish(writeToDestinations: true)
             return
         }
+        let completePlan = items
         if let includedRelativePaths = request.includedRelativePaths {
-            let completePlan = items
             items = completePlan.filter { includedRelativePaths.contains($0.relativePath) }
             let discovered = Set(items.map(\.relativePath))
             let missing = includedRelativePaths.subtracting(discovered).sorted()
@@ -107,12 +114,58 @@ struct TransferWorker {
             await finish(writeToDestinations: false)
             return
         }
-        let planFingerprint = SourcePlanFingerprint.make(items)
-        if let expectedFingerprint = request.sourceFingerprint,
-           expectedFingerprint != planFingerprint {
+        if let expectedFingerprint = request.sourceFingerprint {
+            // A fine-grained retry carries its parent's fingerprint, which
+            // covers the parent's whole plan, not the failed pairs it
+            // repairs: compare like with like. A resume and a selection-only
+            // offload were reviewed as exactly their own items.
+            let reviewedPlan: [SourceItem]
+            if let parent = request.retryManifest {
+                guard let parentPlan = Self.parentPlan(
+                    of: parent, in: completePlan, fingerprint: expectedFingerprint
+                ) else {
+                    vetoed = true
+                    transferIssues.append(Self.retryParentDoesNotDescribePlan)
+                    await hub.log(.error, transferIssues.last ?? "Retry parent manifest unusable")
+                    await finish(writeToDestinations: false)
+                    return
+                }
+                reviewedPlan = parentPlan
+            } else {
+                reviewedPlan = items
+            }
+            if expectedFingerprint != SourcePlanFingerprint.make(reviewedPlan) {
+                vetoed = true
+                // A repair's manifest records its parent's plan identity over
+                // only the files it repaired. Continuing one (a repair of a
+                // repair, or a resume of a paused repair) lands here although
+                // every file that record lists is still on the source exactly
+                // as recorded: the record names another plan, and nothing on
+                // the source changed. Say so instead of blaming the source.
+                let continuedRecord = request.retryManifest ?? request.resumeManifest
+                if let continuedRecord, Self.manifest(continuedRecord, stillDescribes: reviewedPlan) {
+                    transferIssues.append(request.retryManifest == nil
+                        ? Self.pausedRecordDoesNotDescribePlan
+                        : Self.retryParentDoesNotDescribePlan)
+                } else {
+                    transferIssues.append("The source plan changed after review; run preflight again.")
+                }
+                await hub.log(.error, transferIssues.last ?? "Source plan changed")
+                await finish(writeToDestinations: false)
+                return
+            }
+        }
+        // A resume carries on exactly the plan its paused record lists, which
+        // names every planned file, attempted or not. A paused repair's
+        // record lists only the failed pairs it was repairing, and a resume
+        // has no authority to set failed bytes aside: resumed as the whole
+        // card, every file the parent verified would fail as a name collision
+        // with no digest, and so would every failed copy the repair had not
+        // reached. Refuse before any destination is touched.
+        if let pausedRecord = request.resumeManifest, !Self.manifest(pausedRecord, listsExactly: items) {
             vetoed = true
-            transferIssues.append("The source plan changed after review; run preflight again.")
-            await hub.log(.error, transferIssues.last ?? "Source plan changed")
+            transferIssues.append(Self.pausedRecordDoesNotDescribePlan)
+            await hub.log(.error, transferIssues.last ?? "Paused attempt's manifest unusable")
             await finish(writeToDestinations: false)
             return
         }
@@ -131,7 +184,7 @@ struct TransferWorker {
             trustedSourceDigests = sourceMHL.digests
             await hub.log(.info, "Trusted source ASC MHL chain; reusing \(trustedSourceDigests.count) source digests")
         }
-        restoreVerifiedOutcomesFromPausedAttempt()
+        await restoreVerifiedOutcomesFromPausedAttempt()
         guard validateRetryScope() else {
             vetoed = true
             await finish(writeToDestinations: false)
@@ -157,6 +210,7 @@ struct TransferWorker {
 
         await preflightDestinations(totalBytes: totalBytes)
         await verifyDuplicateCandidates()
+        await confirmRemainingCapacity()
         if request.verificationProfile == .maximum {
             await preReadSource()
         }
@@ -168,6 +222,53 @@ struct TransferWorker {
         await verifyPass()
         await confirmSourcePlanUnchanged()
         await finish(writeToDestinations: true)
+    }
+
+    /// The current source items a fine-grained retry's parent attempt
+    /// planned: the parent manifest's own paths, taken from the complete
+    /// enumeration before the retry narrows it to the failed pairs. `nil`
+    /// when the manifest cannot vouch for the reviewed plan: it names no
+    /// files, names one twice, or records a different plan identity than the
+    /// one the retry carries.
+    private static func parentPlan(
+        of parent: TransferManifest,
+        in completePlan: [SourceItem],
+        fingerprint: String
+    ) -> [SourceItem]? {
+        let paths = Set(parent.items.map(\.relativePath))
+        guard !paths.isEmpty,
+              paths.count == parent.items.count,
+              parent.sourceFingerprint == nil || parent.sourceFingerprint == fingerprint
+        else { return nil }
+        return completePlan.filter { paths.contains($0.relativePath) }
+    }
+
+    private static let retryParentDoesNotDescribePlan =
+        "The failed attempt's manifest does not describe the reviewed source plan; "
+            + "the retry cannot be checked against it."
+
+    private static let pausedRecordDoesNotDescribePlan =
+        "The paused attempt's manifest does not describe the source plan being resumed; "
+            + "the resume cannot continue it. Use Retry as New Offload instead."
+
+    /// Whether `manifest` lists exactly the files of `plan`, each once.
+    private static func manifest(_ manifest: TransferManifest, listsExactly plan: [SourceItem]) -> Bool {
+        let paths = manifest.items.map(\.relativePath)
+        return paths.count == plan.count && Set(paths) == Set(plan.map(\.relativePath))
+    }
+
+    /// Whether `manifest` lists exactly the files of `plan` and each still
+    /// has the size and modification time it recorded: as far as that record
+    /// reaches, the source is unchanged.
+    private static func manifest(_ manifest: TransferManifest, stillDescribes plan: [SourceItem]) -> Bool {
+        guard Self.manifest(manifest, listsExactly: plan) else { return false }
+        let iso = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        // Paths are unique here: the manifest lists exactly the plan's files.
+        let recorded = Dictionary(uniqueKeysWithValues: manifest.items.map { ($0.relativePath, $0) })
+        return plan.allSatisfy { item in
+            guard let entry = recorded[item.relativePath], entry.size == item.size else { return false }
+            return entry.modifiedAt == item.modificationTime.map { Date(timeIntervalSince1970: $0).formatted(iso) }
+        }
     }
 
     // MARK: - Validation & preflight
@@ -183,7 +284,7 @@ struct TransferWorker {
             return "Could not identify source volume: \(describe(error))"
         }
         var seen = Set<String>()
-        var seenVolumes = Set<String>()
+        var seenVolumes: [FileSystemVolume] = []
         for destination in request.destinations {
             let base = fileSystem.canonicalURL(destination.baseRoot)
             let output = fileSystem.canonicalURL(destination.outputRoot)
@@ -202,17 +303,29 @@ struct TransferWorker {
                 if volume.isReadOnly {
                     return "Destination \(base.path) is read-only."
                 }
-                if volume.identifier == sourceVolume.identifier,
+                // Independence is a property of physical devices: two APFS
+                // volumes or partitions on one disk, or two shares from one
+                // server, are one failure domain, exactly like one volume.
+                let sameVolume = volume.identifier == sourceVolume.identifier
+                if sourceVolume.sharesPhysicalDevice(with: volume),
                    sourceVolume.isRemovable,
                    source.path == sourceVolume.mountPath {
-                    return "A removable source volume cannot also contain its destination."
+                    // Formatting a card in camera rewrites the whole device,
+                    // so no acknowledgement makes another partition a backup.
+                    return sameVolume
+                        ? "A removable source volume cannot also contain its destination."
+                        : "A removable source's physical device cannot also hold destination \(base.path)."
                 }
-                if volume.identifier == sourceVolume.identifier, !request.allowSameVolume {
-                    return "Source and destination \(base.path) are on the same volume. Explicit acknowledgement is required."
+                if sourceVolume.sharesPhysicalDevice(with: volume), !request.allowSameVolume {
+                    return sameVolume
+                        ? "Source and destination \(base.path) are on the same volume. Explicit acknowledgement is required."
+                        : "Source and destination \(base.path) are on the same physical device. "
+                            + "Explicit acknowledgement is required."
                 }
-                if !seenVolumes.insert(volume.identifier).inserted, !request.allowSameVolume {
+                if seenVolumes.contains(where: { $0.sharesPhysicalDevice(with: volume) }), !request.allowSameVolume {
                     return "Two destinations share the same physical volume. Explicit acknowledgement is required."
                 }
+                seenVolumes.append(volume)
             } catch {
                 return "Could not identify destination volume for \(base.path): \(describe(error))"
             }
@@ -229,7 +342,16 @@ struct TransferWorker {
                 continue
             }
             let duplicateCandidate = request.duplicateManifests[destination.path] != nil
+            // A fresh offload's task folder must not already exist. A direct
+            // output ("Directly in destination") is the operator's own base,
+            // which always exists and can never be new; it is protected per
+            // file instead — exclusive staging, exclusive publish, and a name
+            // collision that fails that file without replacing it. Compared
+            // literally, never through symlink resolution, so a task folder
+            // that merely resolves to its base still counts as existing.
+            let writesDirectlyIntoBase = destination.path == requested.baseRoot.path
             if fileSystem.fileExists(at: destination),
+               !writesDirectlyIntoBase,
                (request.requireNewOutputRoots
                     || (!request.duplicateManifests.isEmpty
                         && !duplicateCandidate
@@ -255,14 +377,64 @@ struct TransferWorker {
                 )
                 continue
             }
-            let reserve = max(Int64(512 * 1024 * 1024), totalBytes / 20)
-            if !duplicateCandidate,
-               let free = try? fileSystem.freeSpace(at: requested.baseRoot), free < totalBytes + reserve {
+            // A duplicate manifest only excuses the bytes it can plausibly
+            // prove; everything else still has to fit. A plan it covers
+            // entirely writes no media, so it needs no headroom up front —
+            // `confirmRemainingCapacity()` re-checks whatever proof fails.
+            let remainder = totalBytes - duplicateCandidateBytes(at: destination)
+            let needed = remainder + Self.reserveBytes(for: totalBytes)
+            if remainder > 0, let free = try? fileSystem.freeSpace(at: requested.baseRoot), free < needed {
                 await failWholeDestination(destination, reason: .destinationFull,
                                            log: "Destination \(requested.baseRoot.path) has " +
                                            "\(MarkdownReportWriter.byteString(free)) free, needs " +
-                                           MarkdownReportWriter.byteString(totalBytes + reserve))
+                                           MarkdownReportWriter.byteString(needed))
             }
+        }
+    }
+
+    /// Working headroom kept free beyond the bytes themselves.
+    static func reserveBytes(for totalBytes: Int64) -> Int64 {
+        max(Int64(512 * 1024 * 1024), totalBytes / 20)
+    }
+
+    /// Bytes a prior verified manifest at `destination` might let the
+    /// duplicate flow skip: same relative path and size, a recorded digest,
+    /// and a verified result at that destination. Only a candidate — the
+    /// exact gate after `verifyDuplicateCandidates()` settles it.
+    private func duplicateCandidateBytes(at destination: URL) -> Int64 {
+        guard let manifest = request.duplicateManifests[destination.path] else { return 0 }
+        let records = Dictionary(manifest.items.map { ($0.relativePath, $0) }, uniquingKeysWith: { first, _ in first })
+        return items.reduce(Int64(0)) { sum, item in
+            guard let record = records[item.relativePath],
+                  record.size == item.size,
+                  record.digest != nil,
+                  record.results.contains(where: {
+                      $0.destination == destination.path && $0.status == "verified"
+                  })
+            else { return sum }
+            return sum + item.size
+        }
+    }
+
+    /// Exact capacity gate once the duplicate flow has proven what it can:
+    /// every pair not already verified at a live destination still has to be
+    /// written there, and must fit beside the reserve before a byte lands.
+    private mutating func confirmRemainingCapacity() async {
+        guard !sourceDead, !cancelled else { return }
+        let totalBytes = items.reduce(Int64(0)) { $0 + $1.size }
+        for requested in request.destinations {
+            let destination = requested.outputRoot
+            guard !deadDestinations.contains(destination) else { continue }
+            let remaining = items.reduce(Int64(0)) { sum, item in
+                outcomes[item.relativePath]?[destination]?.isVerified == true ? sum : sum + item.size
+            }
+            guard remaining > 0 else { continue }
+            let needed = remaining + Self.reserveBytes(for: totalBytes)
+            guard let free = try? fileSystem.freeSpace(at: requested.baseRoot), free < needed else { continue }
+            await failRemainingPairs(destination, reason: .destinationFull,
+                                     log: "Destination \(requested.baseRoot.path) has " +
+                                     "\(MarkdownReportWriter.byteString(free)) free, needs " +
+                                     "\(MarkdownReportWriter.byteString(needed)) for the unverified remainder")
         }
     }
 
@@ -304,6 +476,17 @@ struct TransferWorker {
         }
     }
 
+    /// Like `failWholeDestination`, but pairs this destination has already
+    /// verified (a resumed attempt or a digest-proven duplicate) keep that
+    /// outcome; only the still-unverified remainder is failed.
+    private mutating func failRemainingPairs(_ destination: URL, reason: ItemFailureReason, log message: String) async {
+        deadDestinations.insert(destination)
+        await hub.log(.error, message)
+        for item in items where outcomes[item.relativePath]?[destination]?.isVerified != true {
+            await record(item.relativePath, destination, .failed(reason))
+        }
+    }
+
     // MARK: - Copy pass
 
     private mutating func preReadSource() async {
@@ -327,6 +510,7 @@ struct TransferWorker {
                     buffer.withUnsafeBytes { raw in
                         hasher.update(UnsafeRawBufferPointer(rebasing: raw[0..<count]))
                     }
+                    await hub.addPreReadBytes(count)
                 }
                 preReadDigests[item.relativePath] = hasher.hexDigest()
                 if await control.shouldPause() {
@@ -334,10 +518,21 @@ struct TransferWorker {
                     return
                 }
             } catch {
-                sourceDead = true
-                transferIssues.append("Maximum source pre-read failed at \(item.relativePath): \(describe(error))")
-                await hub.log(.error, transferIssues.last ?? "Source pre-read failed")
-                return
+                // Same split as the copy pass: a vanished source root ends the
+                // offload, but one unreadable file (a bad sector, a permissions
+                // error) fails only that item at every live destination, and
+                // every readable file is still pre-read, copied and verified.
+                await sourceReadFailed(item, error: error)
+                if sourceDead {
+                    transferIssues.append(
+                        "Maximum source pre-read failed at \(item.relativePath): \(describe(error))"
+                    )
+                    return
+                }
+                if await control.shouldPause() {
+                    paused = true
+                    return
+                }
             }
         }
     }
@@ -378,8 +573,23 @@ struct TransferWorker {
         let liveDestinations = request.destinationRoots.filter {
             !deadDestinations.contains($0)
                 && outcomes[item.relativePath]?[$0]?.isVerified != true
+                // Kept from a paused Fast attempt: already published here and
+                // owed a read-back, never a second copy.
+                && outcomes[item.relativePath]?[$0]?.isTransferredPendingVerification != true
         }
         guard !liveDestinations.isEmpty else { return }
+        // Maximum never copies bytes its independent pre-read did not hash.
+        // `preReadSource` has already failed such an item; letting it through
+        // would compare a nil pre-read digest below and misreport a source
+        // change that ends the whole offload.
+        if request.verificationProfile == .maximum, preReadDigests[item.relativePath] == nil {
+            for destination in liveDestinations where outcomes[item.relativePath]?[destination] == nil {
+                await record(item.relativePath, destination, .failed(.sourceUnreadable(
+                    detail: "Maximum independent pre-read did not complete for this file"
+                )))
+            }
+            return
+        }
 
         var writers: [DestinationWriter] = []
         for destination in liveDestinations {
@@ -390,13 +600,24 @@ struct TransferWorker {
             do {
                 try fileSystem.createDirectory(at: target.deletingLastPathComponent())
                 if fileSystem.fileExists(at: target) {
-                    guard try quarantineRetryTargetIfAuthorized(
-                        target,
-                        relativePath: item.relativePath,
-                        destination: destination
-                    ) else { throw FileSystemError.alreadyExists }
+                    switch try await resolveExistingRetryTarget(target, item: item, destination: destination) {
+                    case .quarantined:
+                        break
+                    case .provenDuplicate(let sourceDigest):
+                        // Proven identical to the source: kept in place, never
+                        // rewritten, and no writer is needed here.
+                        digests[item.relativePath] = sourceDigest
+                        await record(item.relativePath, destination, .verifiedDuplicate)
+                        await hub.log(.info, "Existing copy proven identical and kept: \(item.relativePath) at \(destination.path)")
+                        continue
+                    case .refused:
+                        throw FileSystemError.alreadyExists
+                    }
                 }
-                let stream = WriterStreamBox(try fileSystem.openForWritingExclusive(staging))
+                let stream = WriterStreamBox(try fileSystem.openForWritingExclusive(
+                    staging,
+                    durability: request.verificationProfile == .maximum ? .full : .standard
+                ))
                 let channel = BoundedAsyncChannel<[UInt8]>(capacity: 2)
                 let progressHub = hub
                 let writerTask = Task.detached(priority: .userInitiated) { () -> FileSystemError? in
@@ -556,8 +777,15 @@ struct TransferWorker {
         for writer in successfulWriters {
             do {
                 try fileSystem.moveItemExclusive(from: writer.staging, to: writer.target)
+                // The bytes are published and will be independently verified.
+                // A filesystem that refuses the timestamp (some exFAT and SMB
+                // mounts) costs a warning, not the destination.
                 if let modificationTime = item.modificationTime {
-                    try fileSystem.setModificationTime(modificationTime, at: writer.target)
+                    do {
+                        try fileSystem.setModificationTime(modificationTime, at: writer.target)
+                    } catch {
+                        await noteTimestampNotPreserved(at: writer.destination, item: item, error: error)
+                    }
                 }
                 pendingVerify[writer.destination, default: []].append((item, digest))
                 pendingPaths[writer.destination, default: []].insert(item.relativePath)
@@ -597,6 +825,24 @@ struct TransferWorker {
             await record(item.relativePath, destination, .failed(.sourceChanged))
         }
         await hub.log(.error, "\(item.relativePath): source changed during transfer")
+    }
+
+    /// One transfer-level warning per destination, updated in place with a
+    /// running count so the report never fills with one line per file.
+    private mutating func noteTimestampNotPreserved(at destination: URL, item: SourceItem, error: Error) async {
+        await hub.log(.warning, "\(item.relativePath): could not preserve source timestamp at " +
+            "\(destination.path) — \(describe(error)); bytes are published and will be verified")
+        let count = (timestampWarnings[destination]?.count ?? 0) + 1
+        let message = "\(Self.warningIssuePrefix)could not preserve source timestamps on \(count) file(s) at " +
+            "\(destination.path); file contents are unaffected, but a later cascade from this destination " +
+            "will see a different source-plan fingerprint."
+        if let existing = timestampWarnings[destination] {
+            transferIssues[existing.issueIndex] = message
+            timestampWarnings[destination] = (existing.issueIndex, count)
+        } else {
+            transferIssues.append(message)
+            timestampWarnings[destination] = (transferIssues.count - 1, count)
+        }
     }
 
     private mutating func destinationFailed(_ destination: URL, item: SourceItem, error: Error) async {
@@ -714,16 +960,32 @@ struct TransferWorker {
         if Task.isCancelled { cancelled = true }
     }
 
-    /// Restores only pairs that the prior paused attempt independently
-    /// verified and whose source-plan metadata and destination size still
-    /// match. Everything else is copied and verified normally.
-    private mutating func restoreVerifiedOutcomesFromPausedAttempt() {
+    /// Restores pairs a prior paused attempt in this task already settled,
+    /// when the source-plan metadata and the destination file still match.
+    /// Everything else goes through `copy()`, which never overwrites an
+    /// existing file: it fails as a name collision instead.
+    ///
+    /// - `verified`: restored as verified when the destination size matches.
+    /// - `transferred-pending-verification`: restored as pending, never as
+    ///   verified, and only when this resume and the paused attempt are both
+    ///   Fast and the destination still has the source's size and a
+    ///   modification time this task gave it (`publishedTimestampMatches`).
+    ///   That is the same metadata-only evidence a Fast copy records. The
+    ///   paused attempt's source digest is carried forward so a later
+    ///   standalone verification can read the copy back.
+    private mutating func restoreVerifiedOutcomesFromPausedAttempt() async {
         guard let manifest = request.resumeManifest,
               manifest.algorithm == request.algorithm.rawValue
                 || (manifest.algorithm == "xxh64" && request.algorithm == .xxh64)
         else { return }
+        // Only Fast writes pending pairs, and only a Fast resume may carry them
+        // forward unread: Standard and Maximum owe a read-back of every copy.
+        let carriesPendingPairs = request.verificationProfile == .fast
+            && manifest.verificationProfile == VerificationProfile.fast.rawValue
         let iso = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        let pausedRun = Self.runInterval(of: manifest, format: iso)
         let records = Dictionary(uniqueKeysWithValues: manifest.items.map { ($0.relativePath, $0) })
+        var keptPending = 0
         for item in items {
             guard let record = records[item.relativePath],
                   record.size == item.size,
@@ -737,15 +999,60 @@ struct TransferWorker {
             }
             digests[item.relativePath] = digest
             for destination in request.destinationRoots {
-                guard record.results.contains(where: {
-                    $0.destination == destination.path && $0.status == "verified"
-                }) else { continue }
+                let prior = record.results.filter { $0.destination == destination.path }
                 let target = destination.appendingPathComponent(item.relativePath)
                 guard let observed = try? fileSystem.sourceItem(at: target, relativeTo: destination),
                       observed.size == item.size else { continue }
-                outcomes[item.relativePath, default: [:]][destination] = .verified
+                if prior.contains(where: { $0.status == "verified" }) {
+                    outcomes[item.relativePath, default: [:]][destination] = .verified
+                } else if carriesPendingPairs,
+                          prior.count == 1,
+                          prior[0].status == "transferred-pending-verification",
+                          Self.publishedTimestampMatches(
+                              planned: item.modificationTime,
+                              observed: observed.modificationTime,
+                              pausedRun: pausedRun
+                          ) {
+                    outcomes[item.relativePath, default: [:]][destination] = .transferredPendingVerification
+                    keptPending += 1
+                }
             }
         }
+        if keptPending > 0 {
+            await hub.log(.info, "Resume: kept \(keptPending) copy result(s) the paused Fast attempt already " +
+                "transferred; they were not rewritten and still need independent verification")
+        }
+    }
+
+    /// A Fast copy is published with the source's modification time, which a
+    /// destination filesystem stores at its own granularity (HFS+ one second,
+    /// FAT two). A destination that does not keep timestamps (some exFAT and
+    /// SMB mounts) leaves the copy with its publish time instead, inside the
+    /// paused attempt's own run. A file with any other time is not the copy
+    /// this task published. A source with no timestamp gave its copy none to
+    /// compare.
+    private static func publishedTimestampMatches(
+        planned: TimeInterval?,
+        observed: TimeInterval?,
+        pausedRun: ClosedRange<TimeInterval>?
+    ) -> Bool {
+        guard let planned else { return true }
+        guard let observed else { return false }
+        if abs(planned - observed) <= 2 { return true }
+        guard let pausedRun else { return false }
+        return observed >= pausedRun.lowerBound - 2 && observed <= pausedRun.upperBound + 2
+    }
+
+    /// When the attempt `manifest` records ran, or `nil` if it cannot say.
+    private static func runInterval(
+        of manifest: TransferManifest,
+        format: Date.ISO8601FormatStyle
+    ) -> ClosedRange<TimeInterval>? {
+        guard let started = try? Date(manifest.startedAt, strategy: format),
+              let finished = try? Date(manifest.finishedAt, strategy: format),
+              started <= finished
+        else { return nil }
+        return started.timeIntervalSince1970...finished.timeIntervalSince1970
     }
 
     /// Existing output is only a metadata candidate. Every proposed skip
@@ -873,28 +1180,68 @@ struct TransferWorker {
         return true
     }
 
-    /// Preserve the parent's failed bytes under a hidden quarantine tree.
-    /// Nothing is overwritten; evidence remains alongside both generations.
-    private func quarantineRetryTargetIfAuthorized(
+    /// What a fine-grained retry may do with a file already at its target.
+    private enum ExistingRetryTarget {
+        /// The parent's own failed bytes were set aside; publish a fresh copy.
+        case quarantined
+        /// The file there is proven to hold the source's bytes; keep it.
+        case provenDuplicate(sourceDigest: String)
+        /// Unproven: the pair fails as a collision and the file is untouched.
+        case refused
+    }
+
+    /// Decides what a retry does with an existing destination file. Nothing
+    /// is ever overwritten, and a file is moved only on proof:
+    ///
+    /// - The parent recorded a checksum mismatch for this path at this
+    ///   destination, with the digest it read back, and the file there still
+    ///   hashes to that digest: those are the parent's own failed bytes, so
+    ///   they are set aside under `.doppelganger-failed/<parent>/` (one slot
+    ///   per parent and path) and a fresh copy is published.
+    /// - The file there hashes to the parent's recorded source digest and the
+    ///   current source re-hashes to it too: the copy is already correct (the
+    ///   parent published it but never finished verifying it, or an earlier
+    ///   repair fixed it), so it is kept in place as a verified duplicate.
+    ///
+    /// Anything else, including a parent that never wrote the path (a name
+    /// collision, a whole-destination preflight failure, a skipped pair) or
+    /// bytes that match neither digest (another task's verified copy), is
+    /// refused: the pair fails as a collision and the file stays put.
+    private func resolveExistingRetryTarget(
         _ target: URL,
-        relativePath: String,
+        item: SourceItem,
         destination: URL
-    ) throws -> Bool {
+    ) async throws -> ExistingRetryTarget {
         guard let manifest = request.retryManifest,
-              let record = manifest.items.first(where: { $0.relativePath == relativePath }),
-              record.results.contains(where: {
-                  $0.destination == destination.path && $0.status != "verified"
-              })
-        else { return false }
-        let parentID = (manifest.attemptID ?? manifest.transferID).prefix(8).lowercased()
-        let quarantineRoot = destination
-            .appendingPathComponent(".doppelganger-failed", isDirectory: true)
-            .appendingPathComponent(parentID, isDirectory: true)
-        let quarantine = quarantineRoot.appendingPathComponent(relativePath)
-        try fileSystem.createDirectory(at: quarantine.deletingLastPathComponent())
-        guard !fileSystem.fileExists(at: quarantine) else { return false }
-        try fileSystem.moveItemExclusive(from: target, to: quarantine)
-        return true
+              let record = manifest.items.first(where: { $0.relativePath == item.relativePath }),
+              let parentResult = record.results.first(where: { $0.destination == destination.path })
+        else { return .refused }
+        // Identity before anything else, uncached like verification.
+        // Unreadable bytes are unproven.
+        guard let targetDigest = try? await hashFile(target, uncached: true) else { return .refused }
+
+        if parentResult.status == "failed",
+           parentResult.reason == ItemFailureReason.checksumMismatch(expected: "", actual: "").slug,
+           parentResult.actualDigest == targetDigest {
+            let parentID = (manifest.attemptID ?? manifest.transferID).prefix(8).lowercased()
+            let quarantine = destination
+                .appendingPathComponent(".doppelganger-failed", isDirectory: true)
+                .appendingPathComponent(parentID, isDirectory: true)
+                .appendingPathComponent(item.relativePath)
+            guard !fileSystem.fileExists(at: quarantine) else { return .refused }
+            try fileSystem.createDirectory(at: quarantine.deletingLastPathComponent())
+            try fileSystem.moveItemExclusive(from: target, to: quarantine)
+            return .quarantined
+        }
+
+        guard let priorDigest = record.digest, targetDigest == priorDigest, sourceStillMatches(item),
+              let sourceDigest = try? await hashFile(
+                  request.sourceRoot.appendingPathComponent(item.relativePath),
+                  uncached: true
+              ),
+              sourceDigest == priorDigest, sourceStillMatches(item)
+        else { return .refused }
+        return .provenDuplicate(sourceDigest: sourceDigest)
     }
 
     private mutating func confirmSourcePlanUnchanged() async {
@@ -1027,10 +1374,22 @@ struct TransferWorker {
                     if let receipt = try MHLHistoryStore.append(
                         report: provisional,
                         destination: destination,
+                        carryingVerifiedPairsFrom: request.retryManifest,
                         fileSystem: fileSystem
                     ) {
                         receipts.append(receipt)
                     }
+                }
+                // Every generation landed. Tell the session where they are so
+                // an interrupted finalization can be rolled back on relaunch;
+                // the generation filenames alone do not name this transfer.
+                for receipt in receipts {
+                    await hub.mhlGenerationWritten(
+                        destination: receipt.destination,
+                        generationURL: receipt.generationURL,
+                        chainURL: receipt.chainURL,
+                        archiveURL: receipt.archiveURL
+                    )
                 }
             } catch {
                 for receipt in receipts.reversed() {
@@ -1063,6 +1422,10 @@ struct TransferWorker {
         let report = makeReport(status: status, manifestLocations: locations)
         await hub.phase(.done)
         switch status {
+        case .paused where request.verificationProfile == .fast:
+            // Fast never reads a copy back; its completed files are pending.
+            await hub.log(.warning, "Transfer paused safely; completed files were transferred and recorded " +
+                "but still need independent verification")
         case .paused:
             await hub.log(.warning, "Transfer paused safely; completed files were verified and recorded")
         case .transferredPendingVerification:
