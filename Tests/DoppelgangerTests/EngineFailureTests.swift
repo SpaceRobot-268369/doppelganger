@@ -98,6 +98,64 @@ struct EngineFailureTests {
         try expectSourceUntouched(world)
     }
 
+    @Test func refusedTimestampIsAWarningNotADeadDestination() async throws {
+        let world = try makeWorld()
+        // The first item's timestamp fails at dest-b; later items must still
+        // copy there and the published bytes must still verify.
+        world.fs.failModificationTime(pathSuffix: "dest-b/DCIM/100MEDIA/a.bin")
+
+        let run = try await EngineHarness.run(
+            fileSystem: world.fs, source: world.card,
+            destinations: [world.destA, world.destB], spool: world.spool)
+
+        #expect(run.report.status == .verified)
+        for spec in EngineHarness.standardFiles {
+            #expect(run.report.outcome(spec.path, at: world.destA) == .verified)
+            #expect(run.report.outcome(spec.path, at: world.destB) == .verified)
+        }
+        #expect(run.report.verifiedCount == 6)
+        #expect(run.report.failedCount == 0)
+        #expect(FileManager.default.fileExists(
+            atPath: world.destB.appendingPathComponent("DCIM/100MEDIA/a.bin").path))
+        #expect(try world.fixtures.bytes(at: world.destB.appendingPathComponent("DCIM/100MEDIA/a.bin"))
+            == EngineHarness.standardFiles[0].bytes)
+
+        // Exactly one transfer-level warning for that destination, phrased
+        // as a warning, naming the count and the cascade consequence.
+        let warnings = run.report.issues.filter { $0.contains("could not preserve source timestamps") }
+        #expect(warnings.count == 1)
+        #expect(warnings.first?.hasPrefix("Warning:") == true)
+        #expect(warnings.first?.contains("1 file(s) at \(world.destB.path)") == true)
+        #expect(warnings.first?.contains("source-plan fingerprint") == true)
+        #expect(run.events.contains {
+            if case .log(let entry) = $0 {
+                return entry.level == .warning && entry.message.contains("could not preserve source timestamp")
+            }
+            return false
+        })
+        // The manifest carries the same honest verdict.
+        let manifest = try EngineHarness.decodeManifest(at: world.destB, shortID: run.report.shortID)
+        #expect(manifest.status == "verified")
+        try expectSourceUntouched(world)
+    }
+
+    @Test func repeatedTimestampRefusalsCollapseIntoOneCountedWarning() async throws {
+        let world = try makeWorld()
+        world.fs.failModificationTime(pathSuffix: "dest-b/DCIM/100MEDIA/a.bin")
+        world.fs.failModificationTime(pathSuffix: "dest-b/DCIM/100MEDIA/b.bin")
+        world.fs.failModificationTime(pathSuffix: "dest-a/MISC/c.txt")
+
+        let run = try await EngineHarness.run(
+            fileSystem: world.fs, source: world.card,
+            destinations: [world.destA, world.destB], spool: world.spool)
+
+        #expect(run.report.status == .verified)
+        let warnings = run.report.issues.filter { $0.contains("could not preserve source timestamps") }
+        #expect(warnings.count == 2, "one entry per destination")
+        #expect(warnings.contains { $0.contains("2 file(s) at \(world.destB.path)") })
+        #expect(warnings.contains { $0.contains("1 file(s) at \(world.destA.path)") })
+    }
+
     @Test func destinationUnmountMidCopyIsTypedAndSurvivorsComplete() async throws {
         let world = try makeWorld()
         world.fs.markVolumeGoneAfterWriting(bytes: 250_000, under: world.destB)

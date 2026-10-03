@@ -568,14 +568,7 @@ final class ProductDatabase: @unchecked Sendable {
         case .failed: .failed
         case .cancelled: .cancelled
         }
-        let lifecycle: TaskLifecycle = switch verdict {
-        case .paused: .paused
-        case .transferredPendingVerification: .transferredPendingVerification
-        case .verified: .complete
-        case .failed, .needsAttention: .failed
-        case .cancelled: .cancelled
-        case .pending: .complete
-        }
+        let lifecycle = Self.lifecycle(for: verdict)
         let encoder = JSONEncoder()
         let issues = try String(decoding: encoder.encode(report.issues), as: UTF8.self)
         let manifest = TransferManifest(report: report)
@@ -617,12 +610,11 @@ final class ProductDatabase: @unchecked Sendable {
                     lifecycle.rawValue, verdict.rawValue, report.finishedAt.timeIntervalSince1970,
                     issues, id.uuidString.lowercased()
                 ])
-            try db.execute(sql: """
-                UPDATE transfer_tasks SET lifecycle = ?, verdict = ?, updated_at = ? WHERE id = ?
-                """, arguments: [
-                    lifecycle.rawValue, verdict.rawValue, report.finishedAt.timeIntervalSince1970,
-                    taskID.uuidString.lowercased()
-                ])
+            // A finished attempt's file records are exactly its own report.
+            try db.execute(
+                sql: "DELETE FROM file_records WHERE attempt_id = ?",
+                arguments: [id.uuidString.lowercased()]
+            )
             for row in fileRows {
                 try db.execute(sql: """
                     INSERT OR REPLACE INTO file_records
@@ -642,6 +634,13 @@ final class ProductDatabase: @unchecked Sendable {
                         artifact.1, artifact.2, artifact.3, artifact.4, artifact.5
                     ])
             }
+            // The task verdict is derived from every finished attempt, never
+            // copied from this one: a fine-grained retry covers one
+            // destination's subset of the plan, so the attempt that happens to
+            // finish last cannot speak for the whole task. It runs after this
+            // attempt's evidence rows exist, because they decide which
+            // destinations the attempt can vouch for.
+            try Self.refreshTaskAggregate(taskID: taskID, updatedAt: report.finishedAt, db: db)
             try Self.insertAudit(
                 AuditEventRecord(
                     taskID: taskID,
@@ -656,6 +655,17 @@ final class ProductDatabase: @unchecked Sendable {
                 ),
                 db: db
             )
+        }
+    }
+
+    private static func lifecycle(for verdict: TransferVerdict) -> TaskLifecycle {
+        switch verdict {
+        case .paused: .paused
+        case .transferredPendingVerification: .transferredPendingVerification
+        case .verified: .complete
+        case .failed, .needsAttention: .failed
+        case .cancelled: .cancelled
+        case .pending: .complete
         }
     }
 
@@ -691,6 +701,10 @@ final class ProductDatabase: @unchecked Sendable {
 
     /// Idempotently indexes portable manifests left by earlier app versions.
     /// The importer is read-only with respect to the spool and its evidence.
+    /// The catalog's own record wins: a manifest whose attempt the catalog
+    /// already finished is only remembered, and one whose attempt is still
+    /// open is skipped — launch reconciliation closes that attempt as failed,
+    /// never from a manifest it may not own.
     func importSpoolManifests(at root: URL, fallbackProfile: OperatorProfile) throws {
         let manager = FileManager.default
         guard let enumerator = manager.enumerator(
@@ -761,6 +775,26 @@ final class ProductDatabase: @unchecked Sendable {
             }
 
             try writer.write { db in
+                switch try Self.catalogState(ofAttempt: attemptID, db: db) {
+                case .open:
+                    // Never reached a terminal report: this file is uncommitted
+                    // evidence (journal recovery removes it). Write nothing,
+                    // not even bookkeeping.
+                    return
+                case .finished:
+                    // finishAttempt already cataloged the files, evidence, and
+                    // the one terminal event. Only remember the file.
+                    try Self.recordImportedManifest(
+                        canonicalPath: canonicalPath,
+                        transferID: manifest.transferID,
+                        schemaVersion: manifest.schemaVersion,
+                        modifiedAt: modifiedAt,
+                        db: db
+                    )
+                    return
+                case .absent:
+                    break // A manifest the catalog has never seen: import it.
+                }
                 try db.execute(sql: """
                     INSERT OR IGNORE INTO transfer_tasks
                         (id, label, source_path, destination_paths_json, project_id,
@@ -835,26 +869,174 @@ final class ProductDatabase: @unchecked Sendable {
                         taskID: taskID,
                         attemptID: attemptID,
                         actorKind: .system,
-                        action: verdict == .verified ? .attemptCompleted : .attemptFailed,
+                        action: Self.terminalAuditAction(for: verdict),
                         occurredAt: finishedAt,
                         detail: "Imported existing spool manifest"
                     ),
                     db: db
                 )
-                try db.execute(sql: """
-                    INSERT INTO imported_manifests
-                        (canonical_path, transfer_id, schema_version, modified_at, imported_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(canonical_path) DO UPDATE SET
-                        transfer_id = excluded.transfer_id,
-                        schema_version = excluded.schema_version,
-                        modified_at = excluded.modified_at,
-                        imported_at = excluded.imported_at
-                    """, arguments: [
-                        canonicalPath, manifest.transferID, manifest.schemaVersion,
-                        modifiedAt.timeIntervalSince1970, Date().timeIntervalSince1970
-                    ])
+                try Self.recordImportedManifest(
+                    canonicalPath: canonicalPath,
+                    transferID: manifest.transferID,
+                    schemaVersion: manifest.schemaVersion,
+                    modifiedAt: modifiedAt,
+                    db: db
+                )
             }
+        }
+    }
+
+    // MARK: - Abandoned runs
+
+    /// Stored on an attempt that was still open when the app launched. It is
+    /// provenance, not display text, so — like the engine's own issues — it is
+    /// not localized. It repeats the recovered dashboard card's wording.
+    static let abandonedAttemptIssue = "The app exited before this transfer produced a terminal report. Treat every output as incomplete and keep the source media."
+    /// Audit detail for a queued task the app left behind before any attempt.
+    /// Worded from the catalog's side: it never claims nothing was copied.
+    static let neverStartedTaskDetail = "Closed at launch: the app quit before this queued transfer recorded an attempt."
+    /// Audit detail for a queued task the operator withdrew.
+    static let withdrawnTaskDetail = "Withdrawn from the queue before it started."
+
+    struct AbandonedRuns: Equatable, Sendable {
+        var failedAttemptIDs: [UUID] = []
+        var cancelledTaskIDs: [UUID] = []
+    }
+
+    /// Launch reconciliation: closes what no process can still be running.
+    ///
+    /// Call once per launch, before this launch starts any attempt.
+    /// - An attempt registered at or before `launchedAt` that never finished
+    ///   was abandoned by an earlier process (crash, force quit, Quit Anyway).
+    ///   It is closed through `finishAttempt` as failed, so the task aggregate
+    ///   settles exactly as for any other failed attempt. It is never closed
+    ///   as anything else: nothing it left behind is evidence.
+    /// - A task registered at or before `launchedAt` that is still queued and
+    ///   never started an attempt is closed as cancelled.
+    /// Finished attempts and tasks that have moved on are never touched, so a
+    /// second run changes nothing. A row that fails to close stays open (never
+    /// read as success) and is retried at the next launch.
+    @discardableResult
+    func closeAbandonedRuns(before launchedAt: Date, closedAt: Date = Date()) throws -> AbandonedRuns {
+        struct OpenAttempt: Sendable {
+            let id: UUID
+            let taskID: UUID
+            let algorithm: ChecksumAlgorithm
+            let profile: VerificationProfile
+            let sourcePath: String
+            let startedAt: Date
+        }
+        let bound = launchedAt.timeIntervalSince1970
+        let open: [OpenAttempt] = try writer.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT a.id, a.task_id, a.checksum_algorithm, a.verification_profile,
+                       a.started_at, t.source_path
+                FROM transfer_attempts a
+                JOIN transfer_tasks t ON t.id = a.task_id
+                WHERE a.finished_at IS NULL AND COALESCE(a.started_at, 0) <= ?
+                ORDER BY COALESCE(a.started_at, 0), a.rowid
+                """, arguments: [bound]).compactMap { row in
+                guard let id = UUID(uuidString: row["id"]),
+                      let taskID = UUID(uuidString: row["task_id"])
+                else { return nil }
+                let started: Double? = row["started_at"]
+                return OpenAttempt(
+                    id: id,
+                    taskID: taskID,
+                    // Only shapes the in-memory report: finishAttempt never
+                    // persists a report's algorithm or profile.
+                    algorithm: Self.algorithm(fromManifestValue: row["checksum_algorithm"]) ?? .xxh3,
+                    profile: VerificationProfile(rawValue: row["verification_profile"]) ?? .standard,
+                    sourcePath: row["source_path"],
+                    startedAt: started.map(Date.init(timeIntervalSince1970:)) ?? closedAt
+                )
+            }
+        }
+
+        var closed = AbandonedRuns()
+        var firstError: (any Error)?
+        for attempt in open {
+            let report = TransferReport(
+                id: attempt.id,
+                status: .failed,
+                algorithm: attempt.algorithm,
+                verificationProfile: attempt.profile,
+                taskID: attempt.taskID,
+                sourceRoot: URL(fileURLWithPath: attempt.sourcePath, isDirectory: true),
+                // No destinations, items, or manifest locations: an abandoned
+                // attempt committed no evidence, so finishAttempt records no
+                // file results and probes no destination MHL chain on its
+                // behalf (recovery may already have rolled that chain back).
+                destinations: [],
+                startedAt: attempt.startedAt,
+                finishedAt: closedAt,
+                items: [],
+                manifestLocations: [],
+                issues: [Self.abandonedAttemptIssue]
+            )
+            do {
+                try finishAttempt(
+                    id: attempt.id,
+                    taskID: attempt.taskID,
+                    report: report,
+                    verificationProfile: attempt.profile
+                )
+                closed.failedAttemptIDs.append(attempt.id)
+            } catch {
+                firstError = firstError ?? error
+            }
+        }
+
+        do {
+            closed.cancelledTaskIDs = try writer.write { db in
+                let keys = try String.fetchAll(db, sql: """
+                    SELECT t.id FROM transfer_tasks t
+                    WHERE t.lifecycle = ? AND t.verdict = ? AND t.created_at <= ?
+                      AND NOT EXISTS (SELECT 1 FROM transfer_attempts a WHERE a.task_id = t.id)
+                    ORDER BY t.created_at
+                    """, arguments: [
+                        TaskLifecycle.queued.rawValue, TransferVerdict.pending.rawValue, bound,
+                    ])
+                var cancelled: [UUID] = []
+                for key in keys {
+                    let didCancel = try Self.cancelNeverStartedTask(
+                        key: key,
+                        actorKind: .system,
+                        operatorSnapshot: nil,
+                        detail: Self.neverStartedTaskDetail,
+                        at: closedAt,
+                        db: db
+                    )
+                    if didCancel, let id = UUID(uuidString: key) { cancelled.append(id) }
+                }
+                return cancelled
+            }
+        } catch {
+            firstError = firstError ?? error
+        }
+        if let firstError { throw firstError }
+        return closed
+    }
+
+    /// The operator took a queued transfer out of line before it started. Only
+    /// a task that is still queued, pending, and attempt-free is closed; a
+    /// queued resume or retry belongs to a task with earlier attempts, which
+    /// this never touches.
+    @discardableResult
+    func withdrawQueuedTask(
+        id: UUID,
+        operatorProfile: OperatorProfile,
+        at date: Date = Date()
+    ) throws -> Bool {
+        try writer.write { db in
+            try Self.cancelNeverStartedTask(
+                key: id.uuidString.lowercased(),
+                actorKind: .operatorProfile,
+                operatorSnapshot: OperatorSnapshot(profile: operatorProfile),
+                detail: Self.withdrawnTaskDetail,
+                at: date,
+                db: db
+            )
         }
     }
 
@@ -1098,6 +1280,121 @@ final class ProductDatabase: @unchecked Sendable {
         )
     }
 
+    /// The engine's transfer issue for evidence it could not write to some
+    /// roots (`TransferWorker.finish`). Only this issue is scoped per
+    /// destination. Advisory warnings (`TransferWorker.warningIssuePrefix`)
+    /// are neutral; every other issue makes the attempt vouch for nothing.
+    static let evidenceWriteIssuePrefix = "Could not write complete transfer evidence to: "
+
+    /// Destinations an attempt recorded results for.
+    private static func recordedDestinations(_ attemptKey: String, db: Database) throws -> [String] {
+        let rows = try String.fetchAll(
+            db,
+            sql: "SELECT outcomes_json FROM file_records WHERE attempt_id = ?",
+            arguments: [attemptKey]
+        )
+        var destinations = Set<String>()
+        let decoder = JSONDecoder()
+        for json in rows {
+            for pair in (try? decoder.decode([RecordedPairResult].self, from: Data(json.utf8))) ?? [] {
+                destinations.insert(pair.destination)
+            }
+        }
+        return Array(destinations)
+    }
+
+    /// The fields of a recorded per-destination result the rollup needs.
+    private struct RecordedPairResult: Decodable {
+        let destination: String
+        let status: String
+    }
+
+    /// Re-derives the task's verdict and lifecycle from all of its finished
+    /// attempts (`TaskVerdictRollup`). A task with no finished attempt keeps
+    /// its row as registered. Unreadable catalog data is never read as success.
+    private static func refreshTaskAggregate(taskID: UUID, updatedAt: Date, db: Database) throws {
+        let taskKey = taskID.uuidString.lowercased()
+        guard let destinationsJSON = try String.fetchOne(
+            db,
+            sql: "SELECT destination_paths_json FROM transfer_tasks WHERE id = ?",
+            arguments: [taskKey]
+        ) else { return }
+        let decoder = JSONDecoder()
+        let destinations = (try? decoder.decode([String].self, from: Data(destinationsJSON.utf8))) ?? []
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT id, kind, verdict, issues_json FROM transfer_attempts
+            WHERE task_id = ? AND finished_at IS NOT NULL
+            ORDER BY finished_at, COALESCE(started_at, 0), rowid
+            """, arguments: [taskKey])
+        var attempts: [TaskVerdictRollup.Attempt] = []
+        for row in rows {
+            let attemptKey: String = row["id"]
+            let issuesJSON: String = row["issues_json"]
+            // Advisory warnings never fail a run, so they never narrow what
+            // it vouches for: the attempt is judged as if they were absent.
+            let issues = (try? decoder.decode([String].self, from: Data(issuesJSON.utf8)))?
+                .filter { !$0.hasPrefix(TransferWorker.warningIssuePrefix) }
+            let vouching: TaskVerdictRollup.Vouching
+            if let issues, issues.isEmpty {
+                vouching = .everywhere
+            } else if let issues, issues.allSatisfy({ $0.hasPrefix(Self.evidenceWriteIssuePrefix) }) {
+                // Evidence that could not be written to some roots: the
+                // attempt still vouches where its manifest did land.
+                let manifests = try String.fetchAll(
+                    db,
+                    sql: "SELECT path FROM evidence_artifacts WHERE attempt_id = ? AND kind = 'json-manifest'",
+                    arguments: [attemptKey]
+                )
+                let candidates = destinations + (try Self.recordedDestinations(attemptKey, db: db))
+                vouching = .only(Set(candidates.filter { destination in
+                    manifests.contains { $0.hasPrefix(destination + "/") }
+                }))
+            } else {
+                // Any other transfer-level issue (veto, source changed, MHL
+                // failure), or issues that cannot be read: vouch for nothing.
+                vouching = .nowhere
+            }
+            var results: [String: [String: TaskVerdictRollup.PairState]]? = [:]
+            let records = try Row.fetchAll(
+                db,
+                sql: "SELECT relative_path, outcomes_json FROM file_records WHERE attempt_id = ?",
+                arguments: [attemptKey]
+            )
+            for record in records {
+                let path: String = record["relative_path"]
+                let outcomesJSON: String = record["outcomes_json"]
+                guard let pairs = try? decoder.decode(
+                    [RecordedPairResult].self, from: Data(outcomesJSON.utf8)
+                ) else {
+                    results = nil // fail closed
+                    break
+                }
+                var byDestination: [String: TaskVerdictRollup.PairState] = [:]
+                for pair in pairs {
+                    let state = TaskVerdictRollup.PairState(manifestStatus: pair.status)
+                    // A destination listed twice is ambiguous; never success.
+                    byDestination[pair.destination] = byDestination[pair.destination] == nil ? state : .unverified
+                }
+                results?[path] = byDestination
+            }
+            attempts.append(TaskVerdictRollup.Attempt(
+                kind: TransferAttemptKind(rawValue: row["kind"]) ?? .copy,
+                verdict: TransferVerdict(rawValue: row["verdict"]) ?? .failed,
+                vouching: vouching,
+                results: results
+            ))
+        }
+        guard let verdict = TaskVerdictRollup.verdict(destinations: destinations, attempts: attempts)
+        else { return }
+        try db.execute(
+            sql: "UPDATE transfer_tasks SET lifecycle = ?, verdict = ?, updated_at = ? WHERE id = ?",
+            arguments: [
+                Self.lifecycle(for: verdict).rawValue, verdict.rawValue,
+                updatedAt.timeIntervalSince1970, taskKey,
+            ]
+        )
+    }
+
     private static func insertAudit(_ event: AuditEventRecord, db: Database) throws {
         try db.execute(sql: """
             INSERT INTO audit_events
@@ -1136,6 +1433,87 @@ final class ProductDatabase: @unchecked Sendable {
             ])
     }
 
+    /// Closes a task that never started an attempt as cancelled, with one
+    /// audit event. Writes nothing — and returns false — unless the task is
+    /// still queued and pending and has no attempt at all.
+    private static func cancelNeverStartedTask(
+        key: String,
+        actorKind: AuditActorKind,
+        operatorSnapshot: OperatorSnapshot?,
+        detail: String,
+        at date: Date,
+        db: Database
+    ) throws -> Bool {
+        try db.execute(sql: """
+            UPDATE transfer_tasks SET lifecycle = ?, verdict = ?, updated_at = ?
+            WHERE id = ? AND lifecycle = ? AND verdict = ?
+              AND NOT EXISTS (SELECT 1 FROM transfer_attempts WHERE task_id = ?)
+            """, arguments: [
+                TaskLifecycle.cancelled.rawValue, TransferVerdict.cancelled.rawValue,
+                date.timeIntervalSince1970, key,
+                TaskLifecycle.queued.rawValue, TransferVerdict.pending.rawValue, key,
+            ])
+        guard db.changesCount == 1 else { return false }
+        try insertAudit(
+            AuditEventRecord(
+                taskID: UUID(uuidString: key),
+                actorKind: actorKind,
+                operatorSnapshot: operatorSnapshot,
+                action: .taskCancelled,
+                occurredAt: date,
+                detail: detail
+            ),
+            db: db
+        )
+        return true
+    }
+
+    private enum CatalogAttemptState { case absent, open, finished }
+
+    private static func catalogState(ofAttempt id: UUID, db: Database) throws -> CatalogAttemptState {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: "SELECT finished_at FROM transfer_attempts WHERE id = ?",
+            arguments: [id.uuidString.lowercased()]
+        ) else { return .absent }
+        let finished: Double? = row["finished_at"]
+        return finished == nil ? .open : .finished
+    }
+
+    /// The system event that closes an attempt with this verdict — the mapping
+    /// finishAttempt applies to a report's status. A Fast copy is a completed
+    /// attempt (its verdict says verification is pending); a pause is not a
+    /// failure.
+    private static func terminalAuditAction(for verdict: TransferVerdict) -> AuditAction {
+        switch verdict {
+        case .paused: .taskPaused
+        case .verified, .transferredPendingVerification: .attemptCompleted
+        case .pending, .needsAttention, .failed, .cancelled: .attemptFailed
+        }
+    }
+
+    private static func recordImportedManifest(
+        canonicalPath: String,
+        transferID: String,
+        schemaVersion: Int,
+        modifiedAt: Date,
+        db: Database
+    ) throws {
+        try db.execute(sql: """
+            INSERT INTO imported_manifests
+                (canonical_path, transfer_id, schema_version, modified_at, imported_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(canonical_path) DO UPDATE SET
+                transfer_id = excluded.transfer_id,
+                schema_version = excluded.schema_version,
+                modified_at = excluded.modified_at,
+                imported_at = excluded.imported_at
+            """, arguments: [
+                canonicalPath, transferID, schemaVersion,
+                modifiedAt.timeIntervalSince1970, Date().timeIntervalSince1970,
+            ])
+    }
+
     private static func algorithm(fromManifestValue value: String) -> ChecksumAlgorithm? {
         value == "xxh64" ? .xxh64 : ChecksumAlgorithm(rawValue: value)
     }
@@ -1163,5 +1541,173 @@ final class ProductDatabase: @unchecked Sendable {
             occurredAt: Date(timeIntervalSince1970: row["occurred_at"]),
             detail: row["detail"]
         )
+    }
+}
+
+/// Derives a task's catalog verdict from every attempt that has finished.
+///
+/// A task aggregates immutable attempts (offload-model.md), so its verdict is
+/// a projection, never a copy of whichever attempt finished last. A
+/// fine-grained retry covers one destination's subset of the plan; the task
+/// reads Verified only when every item of the plan has a verified result at
+/// every destination, taken from the latest attempt that addressed that pair.
+/// Partial failure is failure, and nothing unreadable is read as success.
+enum TaskVerdictRollup {
+    /// One item × destination result as an attempt recorded it.
+    enum PairState: Sendable, Equatable {
+        case verified
+        case pendingVerification
+        /// Failed, skipped, or a status this projection does not recognise.
+        case unverified
+
+        /// Maps `TransferManifest.ItemRecord.Result.status`.
+        init(manifestStatus: String) {
+            switch manifestStatus {
+            case "verified": self = .verified
+            case "transferred-pending-verification": self = .pendingVerification
+            default: self = .unverified
+            }
+        }
+    }
+
+    /// Where an attempt's own results count as evidence.
+    enum Vouching: Sendable, Equatable {
+        /// No transfer-level issue other than advisory warnings.
+        case everywhere
+        /// Evidence could not be written everywhere; its results count only
+        /// at destinations where its manifest landed.
+        case only(Set<String>)
+        /// A transfer-level failure (veto, source changed, MHL, unreadable
+        /// issues): none of its verified results count.
+        case nowhere
+
+        func covers(_ destination: String) -> Bool {
+            switch self {
+            case .everywhere: true
+            case .only(let destinations): destinations.contains(destination)
+            case .nowhere: false
+            }
+        }
+    }
+
+    struct Attempt: Sendable {
+        var kind: TransferAttemptKind
+        var verdict: TransferVerdict
+        var vouching: Vouching
+        /// Relative path → destination path → state; `nil` when the attempt's
+        /// file records could not be read.
+        var results: [String: [String: PairState]]?
+    }
+
+    /// - Parameters:
+    ///   - destinations: the task's planned destination paths.
+    ///   - attempts: finished attempts, oldest result first.
+    /// - Returns: the task verdict, or `nil` when no attempt bears on it.
+    static func verdict(destinations: [String], attempts: [Attempt]) -> TransferVerdict? {
+        var standing: [Pair: PairState] = [:]
+        var items = Set<String>()
+        var planDestinations = Set(destinations)
+        var unreadable = false
+        var base: TransferVerdict?
+
+        for attempt in attempts {
+            switch attempt.kind {
+            case .contactSheet:
+                // Optional artifacts never move the media verdict.
+                continue
+            case .verification where base != nil:
+                // A verification linked to an existing task may lift copies
+                // still awaiting read-back to verified. It never edits a
+                // failure into success, and a failed check stays on its own
+                // attempt row.
+                guard attempt.verdict == .verified, attempt.vouching == .everywhere,
+                      let results = attempt.results else { continue }
+                for (path, byDestination) in results {
+                    for (destination, state) in byDestination where state == .verified {
+                        let pair = Pair(path: path, destination: destination)
+                        if standing[pair] == .pendingVerification { standing[pair] = .verified }
+                    }
+                }
+                if base == .transferredPendingVerification { base = .verified }
+            case .retry where base != nil:
+                // A repair is repair-only. Since a retry can never move a
+                // copy it cannot prove is the parent's failed bytes, its own
+                // failure says nothing about pairs that already stand
+                // verified: its proven results raise pairs, and anything else
+                // leaves the standing state alone.
+                if attempt.verdict == .verified || attempt.verdict == .transferredPendingVerification {
+                    base = attempt.verdict
+                }
+                guard let results = attempt.results else {
+                    unreadable = true
+                    continue
+                }
+                let vouches = attempt.verdict == .verified
+                    || attempt.verdict == .transferredPendingVerification
+                    || attempt.vouching != .nowhere
+                for (path, byDestination) in results {
+                    items.insert(path)
+                    for (destination, state) in byDestination {
+                        planDestinations.insert(destination)
+                        let pair = Pair(path: path, destination: destination)
+                        let counts = vouches && attempt.vouching.covers(destination)
+                        switch (counts ? state : .unverified, standing[pair]) {
+                        case (.verified, _):
+                            standing[pair] = .verified
+                        case (.pendingVerification, .verified?):
+                            break
+                        case (.pendingVerification, _):
+                            standing[pair] = .pendingVerification
+                        case (.unverified, nil):
+                            standing[pair] = .unverified
+                        case (.unverified, _?):
+                            break
+                        }
+                    }
+                }
+            default:
+                base = attempt.verdict
+                guard let results = attempt.results else {
+                    unreadable = true
+                    continue
+                }
+                // A run that ended unsuccessfully for a transfer-level reason
+                // (source changed, veto, MHL) does not vouch for the copies it
+                // lists as verified; one whose evidence missed some roots
+                // still vouches where its manifest landed.
+                let vouches = attempt.verdict == .verified
+                    || attempt.verdict == .transferredPendingVerification
+                for (path, byDestination) in results {
+                    items.insert(path)
+                    for (destination, state) in byDestination {
+                        planDestinations.insert(destination)
+                        let counts = vouches || attempt.vouching.covers(destination)
+                        standing[Pair(path: path, destination: destination)] = counts ? state : .unverified
+                    }
+                }
+            }
+        }
+
+        guard let base else { return nil }
+        // Only success is capped by the pairs; any other latest outcome
+        // already says the task is not verified.
+        guard base == .verified || base == .transferredPendingVerification else { return base }
+        guard !unreadable, !items.isEmpty, !planDestinations.isEmpty else { return .failed }
+        var pending = base == .transferredPendingVerification
+        for path in items {
+            for destination in planDestinations {
+                switch standing[Pair(path: path, destination: destination)] {
+                case .verified?: break
+                case .pendingVerification?: pending = true
+                case .unverified?, nil: return .failed
+                }
+            }
+        }
+        return pending ? .transferredPendingVerification : .verified
+    }
+
+    private struct Pair: Hashable {
+        let path: String
+        let destination: String
     }
 }

@@ -1,6 +1,117 @@
 import Foundation
 import Observation
 
+// MARK: - Source eject gate
+
+/// What a verified attempt may offer for its source card, and why. Only
+/// `.available` ever reaches an unmount.
+enum SourceEjectEligibility: Equatable, Sendable {
+    /// Not verified, not a removable whole-volume source, or no recorded volume.
+    case notOffered
+    /// The recorded volume has no UUID, so a same-named card mounted at the
+    /// same path could not be told apart from it.
+    case identityUnverifiable
+    /// Nothing is mounted at the recorded mount point any more.
+    case sourceGone
+    /// Something is mounted at the recorded mount point, but not this card.
+    case differentVolumeMounted
+    /// Other queued or running transfers still use this volume.
+    case inUse(count: Int)
+    case available
+}
+
+/// One dashboard attempt's hold on storage, as the eject gate sees it.
+struct SourceEjectClaim: Equatable, Sendable {
+    let sessionID: UUID
+    let isActive: Bool
+    /// Volume identifiers of the attempt's source and destination bases.
+    let volumeIdentifiers: Set<String>
+    /// Canonical source and destination-base paths, which still match when
+    /// a volume could not be resolved.
+    let paths: [String]
+}
+
+enum SourceEjectOutcome: Equatable, Sendable {
+    case ejected
+    case refused(SourceEjectEligibility)
+    case failed(String)
+
+    var message: String {
+        switch self {
+        case .ejected:
+            L10n.text("Source safely ejected.")
+        case .failed(let reason):
+            L10n.format("Could not eject source: %@", reason)
+        case .refused(.sourceGone):
+            L10n.text("Not ejected: the verified source is no longer mounted.")
+        case .refused(.differentVolumeMounted):
+            L10n.text("Not ejected: a different volume is now mounted where the verified source was.")
+        case .refused(.inUse(let count)):
+            count == 1
+                ? L10n.text("Not ejected: another transfer still uses this source.")
+                : L10n.format("Not ejected: %lld other transfers still use this source.", Int64(count))
+        case .refused:
+            L10n.text("Not ejected: Doppelganger could not confirm this is the verified source volume.")
+        }
+    }
+}
+
+/// The Eject Source decision as a pure function of snapshots.
+enum SourceEjectGate {
+    static func evaluate(
+        sessionID: UUID,
+        verdict: TransferStatus?,
+        sourcePath: String,
+        recorded: FileSystemVolume?,
+        live: FileSystemVolume?,
+        claims: [SourceEjectClaim]
+    ) -> SourceEjectEligibility {
+        guard verdict == .verified,
+              let recorded,
+              recorded.isRemovable,
+              sourcePath == recorded.mountPath
+        else { return .notOffered }
+        guard hasStableIdentity(recorded) else { return .identityUnverifiable }
+        // volume(at:) walks up from a mount point that no longer exists, so an
+        // ejected or pulled card resolves to the parent volume and lands here.
+        guard let live, live.mountPath == recorded.mountPath else { return .sourceGone }
+        guard live.identifier == recorded.identifier,
+              live.isRemovable,
+              live.totalBytes == recorded.totalBytes
+        else { return .differentVolumeMounted }
+        let mountPrefix = recorded.mountPath + "/"
+        let users = claims.filter { claim in
+            claim.sessionID != sessionID && claim.isActive && (
+                claim.volumeIdentifiers.contains(recorded.identifier)
+                    || claim.paths.contains { $0 == recorded.mountPath || $0.hasPrefix(mountPrefix) }
+            )
+        }
+        return users.isEmpty ? .available : .inUse(count: users.count)
+    }
+
+    /// Only a real volume UUID tells two same-named cards apart. RealFileSystem
+    /// falls back to the mount path when a volume reports none.
+    static func hasStableIdentity(_ volume: FileSystemVolume) -> Bool {
+        UUID(uuidString: volume.identifier) != nil
+    }
+
+    /// Calls `eject` only for `.available`, and with the checked mount point.
+    static func perform(
+        _ eligibility: SourceEjectEligibility,
+        mountPath: String?,
+        eject: (URL) throws -> Void
+    ) -> SourceEjectOutcome {
+        guard eligibility == .available else { return .refused(eligibility) }
+        guard let mountPath else { return .refused(.notOffered) }
+        do {
+            try eject(URL(fileURLWithPath: mountPath, isDirectory: true))
+            return .ejected
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+}
+
 /// One transfer, from launch to terminal report. Each session owns its own
 /// engine instance, so several offloads can run side by side; the dashboard
 /// lists sessions in creation order.
@@ -21,13 +132,21 @@ final class TransferSession: Identifiable {
     let projectID: UUID?
     let sourceFingerprint: String?
     let allowSameVolume: Bool
-    let availableBytesByDestination: [URL: Int64]
+    /// Free bytes per output root, measured on the destination's base volume.
+    /// Captured at creation, then refreshed on a coarse heartbeat while the
+    /// transfer runs — see `ensureFreeSpaceRefresh()`.
+    private(set) var availableBytesByDestination: [URL: Int64]
     let createdAt: Date
     let sourceVolume: FileSystemVolume?
     let isRecovered: Bool
     private(set) var shortID = ""
 
-    private(set) var progress = TransferProgress(phase: .enumerating)
+    private(set) var progress = TransferProgress(phase: .enumerating) {
+        didSet {
+            recordThroughputSample()
+            ensureFreeSpaceRefresh()
+        }
+    }
     private(set) var planItemCount = 0
     private(set) var planTotalBytes: Int64 = 0
     private(set) var logEntries: [TransferLogEntry] = []
@@ -35,13 +154,22 @@ final class TransferSession: Identifiable {
     private(set) var liveFailures: [(relativePath: String, destination: URL, reason: String)] = []
     private(set) var cancelRequested = false
     private(set) var pauseRequested = false
-    private(set) var report: TransferReport?
+    private(set) var report: TransferReport? {
+        didSet { if report != nil { stopFreeSpaceRefresh() } }
+    }
     private(set) var lastLogFileURL: URL?
     private(set) var started = false
     private(set) var partialCleanupMessage: String?
     private(set) var contactSheetURL: URL?
     private(set) var contactSheetMessage: String?
     var showLog = false
+    /// Presentation only, never persisted or journaled. True while a linked
+    /// resume or repair attempt has taken this attempt's destinations over:
+    /// the operator carries on from that attempt's card, so this one must no
+    /// longer promise Resume. The attempt-lifecycle owner sets it when a
+    /// resume/repair child claims this attempt as its parent, and clears it
+    /// when that claim is released; nothing else writes it.
+    var continuedInLinkedAttempt = false
 
     /// Fired once, on the main actor, when the terminal report arrives — the
     /// queue scheduler and notifier hang off this.
@@ -56,8 +184,16 @@ final class TransferSession: Identifiable {
     private var journal: TransferJournal
     private let resumeManifest: TransferManifest?
     private let retryManifest: TransferManifest?
-    private let includedRelativePaths: Set<String>?
+    /// The exact source items this attempt was asked to transfer, or `nil`
+    /// for the whole source. A resume carries it forward unchanged.
+    let includedRelativePaths: Set<String>?
     private let duplicateManifests: [String: TransferManifest]
+
+    /// Recent (time, bytes) samples for the sliding-window rate — overall and
+    /// per destination. Presentation-only; never persisted.
+    private var throughputSamples: [ThroughputSample] = []
+    private var destinationThroughputSamples: [URL: [ThroughputSample]] = [:]
+    private var freeSpaceTask: Task<Void, Never>?
 
     init(
         id: UUID = UUID(),
@@ -75,6 +211,7 @@ final class TransferSession: Identifiable {
         allowSameVolume: Bool = false,
         createdAt: Date = Date(),
         recoveredIssue: String? = nil,
+        restoredReport: TransferReport? = nil,
         resumeManifest: TransferManifest? = nil,
         retryManifest: TransferManifest? = nil,
         includedRelativePaths: Set<String>? = nil,
@@ -132,10 +269,17 @@ final class TransferSession: Identifiable {
             startedAt: nil,
             itemCount: 0,
             totalBytes: 0,
-            status: .queued
+            status: .queued,
+            includedRelativePaths: includedRelativePaths?.sorted()
         )
 
-        if let recoveredIssue {
+        if let restoredReport {
+            // Offered again after relaunch: show the finished verdict and never
+            // touch the journal, which still records it exactly.
+            started = true
+            shortID = restoredReport.shortID
+            report = restoredReport
+        } else if let recoveredIssue {
             started = true
             shortID = String(id.uuidString.prefix(8)).lowercased()
             planItemCount = journal.itemCount
@@ -171,7 +315,10 @@ final class TransferSession: Identifiable {
         }
     }
 
-    convenience init(interrupted journal: TransferJournal) {
+    convenience init(
+        interrupted journal: TransferJournal,
+        issue: String = "The app exited before this transfer produced a terminal report. Treat every output as incomplete and keep the source media."
+    ) {
         self.init(
             id: journal.id,
             taskID: journal.taskID,
@@ -192,7 +339,38 @@ final class TransferSession: Identifiable {
             sourceFingerprint: journal.sourceFingerprint,
             allowSameVolume: journal.allowSameVolume,
             createdAt: journal.createdAt,
-            recoveredIssue: "The app exited before this transfer produced a terminal report. Treat every output as incomplete and keep the source media."
+            recoveredIssue: issue,
+            includedRelativePaths: journal.includedRelativePaths.map { Set($0) }
+        )
+        planItemCount = journal.itemCount
+        planTotalBytes = journal.totalBytes
+    }
+
+    /// A paused or Fast-pending attempt offered again after relaunch.
+    convenience init(restoring attempt: RestorableAttempt) {
+        let journal = attempt.journal
+        self.init(
+            id: journal.id,
+            taskID: journal.taskID,
+            parentAttemptID: journal.parentAttemptID,
+            attemptKind: journal.attemptKind ?? .copy,
+            label: journal.label,
+            source: journal.source,
+            destinations: zip(journal.destinationBases, journal.destinations).map {
+                TransferDestination(baseRoot: $0.0, outputRoot: $0.1)
+            },
+            algorithm: journal.algorithm,
+            verificationProfile: journal.verificationProfile ?? .standard,
+            operatorProfile: OperatorProfile(
+                id: journal.operatorProfileID ?? UUID(),
+                displayName: journal.operatorDisplayName ?? "Unknown Operator"
+            ),
+            projectID: journal.projectID,
+            sourceFingerprint: journal.sourceFingerprint,
+            allowSameVolume: journal.allowSameVolume,
+            createdAt: journal.createdAt,
+            restoredReport: attempt.report,
+            includedRelativePaths: journal.includedRelativePaths.map { Set($0) }
         )
         planItemCount = journal.itemCount
         planTotalBytes = journal.totalBytes
@@ -202,9 +380,26 @@ final class TransferSession: Identifiable {
     var isActive: Bool { report == nil }
     var isQueued: Bool { !started && report == nil }
     var isRunning: Bool { started && report == nil }
-    var hasAttention: Bool {
-        !liveFailures.isEmpty || (report.map { $0.status == .failed || $0.status == .cancelled } ?? false)
+
+    /// The one definition of "needs attention" the dashboard, the filter chip,
+    /// and the sidebar footer all share: a live failure, a failed or cancelled
+    /// verdict, or a Fast-profile copy whose source still cannot be erased.
+    /// Paused is deliberate — it has its own Resume action — so it is not
+    /// attention.
+    var needsAttention: Bool {
+        Self.needsAttention(liveFailureCount: liveFailures.count, status: report?.status)
     }
+
+    nonisolated static func needsAttention(liveFailureCount: Int, status: TransferStatus?) -> Bool {
+        if liveFailureCount > 0 { return true }
+        switch status {
+        case .failed, .cancelled, .transferredPendingVerification: return true
+        case .paused, .verified, nil: return false
+        }
+    }
+
+    @available(*, deprecated, renamed: "needsAttention")
+    var hasAttention: Bool { needsAttention }
 
     var failedPairCount: Int {
         guard let report else { return 0 }
@@ -226,12 +421,21 @@ final class TransferSession: Identifiable {
         return destinationBases[index]
     }
 
-    /// Queue resources are volume identifiers, not folder paths.
+    /// Queue resources are volume identifiers, not folder paths, plus the
+    /// physical device behind each volume when it is known
+    /// (`FileSystemVolume.physicalDeviceIdentifier`, valid for this boot and
+    /// never persisted). Two APFS volumes or partitions on one disk, or two
+    /// shares from one server, are one device, so the queue never runs two
+    /// transfers on it side by side.
     var resourceIDs: Set<String> {
         let fileSystem = RealFileSystem()
-        return Set(([source] + destinationBases).compactMap {
-            try? fileSystem.volume(at: $0).identifier
-        })
+        return Self.queueResources(
+            of: ([source] + destinationBases).compactMap { try? fileSystem.volume(at: $0) }
+        )
+    }
+
+    nonisolated static func queueResources(of volumes: [FileSystemVolume]) -> Set<String> {
+        Set(volumes.flatMap { [$0.identifier] + [$0.physicalDeviceIdentifier].compactMap { $0 } })
     }
 
     // MARK: - Lifecycle
@@ -325,17 +529,21 @@ final class TransferSession: Identifiable {
         case .log(let entry):
             logEntries.append(entry)
             logStore?.append(entry)
+        case .mhlGenerationWritten(let destination, let generationURL, let chainURL, let archiveURL):
+            journal.mhlGenerations = (journal.mhlGenerations ?? []) + [MHLGenerationRecord(
+                destination: destination,
+                generationURL: generationURL,
+                chainURL: chainURL,
+                archiveURL: archiveURL
+            )]
+            journalStore.save(journal)
         case .finished(let finished):
             logStore?.close()
             logStore = nil
             report = finished
-            journal.status = switch finished.status {
-            case .paused: .paused
-            case .transferredPendingVerification: .transferredPendingVerification
-            case .verified: .verified
-            case .failed: .failed
-            case .cancelled: .cancelled
-            }
+            // Paused and Fast-pending attempts are offered again after relaunch;
+            // a linked attempt stopped before any destination releases its parent.
+            journal.recordVerdict(of: finished)
             journalStore.save(journal)
             onFinished?()
         }
@@ -347,7 +555,13 @@ final class TransferSession: Identifiable {
     /// + one verify pass per destination).
     var overallFraction: Double {
         if let report {
-            return report.status == .verified ? 1 : lastKnownFraction
+            // Both terminal "all bytes landed" verdicts are 100% of the work
+            // this profile promised; the colour, not the number, says whether
+            // that is verified (green) or still pending read-back (yellow).
+            switch report.status {
+            case .verified, .transferredPendingVerification: return 1
+            case .failed, .cancelled, .paused: return lastKnownFraction
+            }
         }
         return lastKnownFraction
     }
@@ -355,33 +569,99 @@ final class TransferSession: Identifiable {
     private var lastKnownFraction: Double {
         let total = Double(planTotalBytes) * Double(workPassCount)
         guard total > 0 else { return 0 }
-        let done = Double(progress.copiedBytes) +
-            Double(progress.verifiedBytesByDestination.values.reduce(0, +))
-        return min(done / total, 1)
+        return min(Double(doneBytes) / total, 1)
     }
 
+    /// Rate over the last `ThroughputWindow.duration` seconds of progress
+    /// samples, falling back to the cumulative rate until two samples exist.
     var throughputBytesPerSecond: Double {
         guard isActive, let runStarted else { return 0 }
-        let elapsed = Date().timeIntervalSince(runStarted)
+        let now = Date()
+        if let windowed = ThroughputWindow.rate(
+            samples: throughputSamples,
+            now: now.timeIntervalSinceReferenceDate
+        ) {
+            return windowed
+        }
+        let elapsed = now.timeIntervalSince(runStarted)
         guard elapsed > 0.5 else { return 0 }
-        let done = Double(progress.copiedBytes) +
-            Double(progress.verifiedBytesByDestination.values.reduce(0, +))
-        return done / elapsed
+        return Double(doneBytes) / elapsed
     }
 
     var etaSeconds: Double? {
         let rate = throughputBytesPerSecond
         guard rate > 0 else { return nil }
         let total = Double(planTotalBytes) * Double(workPassCount)
-        let done = Double(progress.copiedBytes) +
-            Double(progress.verifiedBytesByDestination.values.reduce(0, +))
+        let done = Double(doneBytes)
         guard total > done else { return 0 }
         return (total - done) / rate
     }
 
+    // MARK: - Throughput sampling
+
+    /// Appends one (time, bytes) sample overall and per destination whenever
+    /// a progress snapshot lands, keeping only what the window needs.
+    private func recordThroughputSample() {
+        let now = Date().timeIntervalSinceReferenceDate
+        throughputSamples = ThroughputWindow.appending(
+            ThroughputSample(time: now, bytes: doneBytes),
+            to: throughputSamples,
+            now: now
+        )
+        for destination in destinations {
+            destinationThroughputSamples[destination] = ThroughputWindow.appending(
+                ThroughputSample(time: now, bytes: destinationDoneBytes(destination)),
+                to: destinationThroughputSamples[destination] ?? [],
+                now: now
+            )
+        }
+    }
+
+    private func destinationDoneBytes(_ destination: URL) -> Int64 {
+        (progress.copiedBytesByDestination[destination] ?? 0)
+            + (progress.verifiedBytesByDestination[destination] ?? 0)
+    }
+
+    // MARK: - Live free space
+
+    /// Starts one coarse heartbeat that re-reads each destination volume's
+    /// free space off the main actor while the transfer runs. The heartbeat
+    /// ends by itself once a terminal report lands.
+    private func ensureFreeSpaceRefresh() {
+        guard freeSpaceTask == nil, isRunning else { return }
+        let pairs = Array(zip(destinations, destinationBases))
+        freeSpaceTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.freeSpaceRefreshInterval))
+                guard !Task.isCancelled, let self, self.isRunning else { return }
+                let fresh = await Self.measureFreeSpace(pairs)
+                guard !Task.isCancelled, self.isRunning else { return }
+                self.availableBytesByDestination = fresh
+            }
+        }
+    }
+
+    private func stopFreeSpaceRefresh() {
+        freeSpaceTask?.cancel()
+        freeSpaceTask = nil
+    }
+
+    private static let freeSpaceRefreshInterval: Double = 5
+
+    /// Runs on the generic executor, never the main actor: volume metadata
+    /// reads can stall on a slow or sleeping external drive.
+    private nonisolated static func measureFreeSpace(_ pairs: [(URL, URL)]) async -> [URL: Int64] {
+        let fileSystem = RealFileSystem()
+        return Dictionary(uniqueKeysWithValues: pairs.compactMap { output, base in
+            guard let free = try? fileSystem.freeSpace(at: base) else { return nil }
+            return (output, free)
+        })
+    }
+
     /// Bytes finished so far across copy + verify, for the "24.7 GB of 36.2 GB" line.
     var doneBytes: Int64 {
-        progress.copiedBytes + progress.verifiedBytesByDestination.values.reduce(0, +)
+        progress.preReadBytes + progress.copiedBytes
+            + progress.verifiedBytesByDestination.values.reduce(0, +)
     }
 
     var workBudgetBytes: Int64 {
@@ -407,31 +687,45 @@ final class TransferSession: Identifiable {
     /// The status line under the card title — phase-specific while running,
     /// verdict once terminal. Copy completing is never presented as success.
     var headline: (text: String, isProblem: Bool) {
-        if isQueued { return ("Queued · waiting for a slot", false) }
+        if isQueued { return (L10n.text("Queued · waiting for a slot"), false) }
         if let report {
             switch report.status {
-            case .paused: return ("Paused safely · Resume available", false)
+            case .paused:
+                return (Self.pausedHeadline(continuedInLinkedAttempt: continuedInLinkedAttempt), false)
             case .transferredPendingVerification:
-                return ("Transferred · verification pending", false)
-            case .verified: return ("Verified · Complete", false)
+                return (L10n.text("Transferred · verification pending"), false)
+            case .verified: return (L10n.text("Verified · Complete"), false)
             case .failed:
-                if isRecovered { return ("Interrupted · Review required", true) }
-                if report.failedCount > 0 {
-                    return ("Failed · \(report.failedCount) copy result\(report.failedCount == 1 ? "" : "s") failed", true)
+                if isRecovered { return (L10n.text("Interrupted · Review required"), true) }
+                if report.failedCount == 1 {
+                    return (L10n.text("Failed · 1 copy result failed"), true)
                 }
-                return ("Failed · transfer evidence incomplete", true)
-            case .cancelled: return ("Cancelled · Incomplete", true)
+                if report.failedCount > 1 {
+                    return (L10n.format("Failed · %lld copy results failed", Int64(report.failedCount)), true)
+                }
+                return (L10n.text("Failed · transfer evidence incomplete"), true)
+            case .cancelled: return (L10n.text("Cancelled · Incomplete"), true)
             }
         }
-        let percent = Int(overallFraction * 100)
+        let percent = Int64(overallFraction * 100)
         switch progress.phase {
-        case .enumerating: return ("Scanning source…", false)
-        case .preReadingSource: return ("Maximum · reading source…", false)
-        case .copying: return ("Copying · \(percent)%", false)
-        case .verifying: return ("Verifying · \(percent)%", false)
-        case .writingManifest: return ("Writing manifest…", false)
-        case .done: return ("Finishing…", false)
+        case .enumerating: return (L10n.text("Scanning source…"), false)
+        case .preReadingSource: return (L10n.text("Maximum · reading source…"), false)
+        case .copying: return (L10n.format("Copying · %lld%%", percent), false)
+        case .verifying: return (L10n.format("Verifying · %lld%%", percent), false)
+        case .writingManifest: return (L10n.text("Writing manifest…"), false)
+        case .done: return (L10n.text("Finishing…"), false)
         }
+    }
+
+    /// A paused card promises Resume only while no linked attempt has taken
+    /// it over. Once one has, a Resume here would run against files that
+    /// attempt already published, so the headline points onward instead. It
+    /// stays a non-problem headline, like the paused verdict itself.
+    nonisolated static func pausedHeadline(continuedInLinkedAttempt: Bool) -> String {
+        continuedInLinkedAttempt
+            ? L10n.text("Paused · continued in a linked attempt")
+            : L10n.text("Paused safely · Resume available")
     }
 
     // MARK: - Per-destination presentation
@@ -444,21 +738,17 @@ final class TransferSession: Identifiable {
         case paused
         case verified
         case failed
+        /// Every pair at this destination landed — verified, or under Fast
+        /// transferred and still owed a read-back — but the transfer did not
+        /// verify: its evidence or ASC MHL could not be written, the source
+        /// changed or could not be re-scanned after the copy, another
+        /// destination failed, or Cancel landed. Red, never green or yellow.
+        case transferNotVerified
     }
 
     func destinationState(_ destination: URL) -> DestinationState {
         if let report {
-            if report.status == .paused { return .paused }
-            let failures = report.items.filter {
-                if case .failed = $0.outcomes[destination] { return true } else { return false }
-            }.count
-            let verified = report.items.filter { $0.outcomes[destination]?.isVerified == true }.count
-            if failures > 0 { return .failed }
-            let pending = report.items.filter {
-                $0.outcomes[destination]?.isTransferredPendingVerification == true
-            }.count
-            if pending == report.items.count && !report.items.isEmpty { return .pendingVerification }
-            return verified == report.items.count && !report.items.isEmpty ? .verified : .failed
+            return Self.terminalDestinationState(of: report, at: destination)
         }
         switch progress.phase {
         case .enumerating, .preReadingSource: return .pending
@@ -467,15 +757,53 @@ final class TransferSession: Identifiable {
         }
     }
 
+    /// One destination's terminal tile state, from the report alone. Green
+    /// needs all three: every pair here verified, the transfer's own verdict
+    /// verified, and this destination among the places its evidence landed.
+    /// Fast's yellow has the same shape: every pair here landed, a
+    /// transferred-pending-verification verdict, and evidence here. The
+    /// engine fails or cancels a run without touching any pair's outcome
+    /// (evidence or MHL write failure, post-copy source re-scan veto, Cancel
+    /// while finalizing, a failure at another destination), so outcomes alone
+    /// never earn green or yellow.
+    nonisolated static func terminalDestinationState(
+        of report: TransferReport,
+        at destination: URL
+    ) -> DestinationState {
+        if report.status == .paused { return .paused }
+        let outcomes = report.items.map { $0.outcomes[destination] }
+        // Landed: read back and matched, or (Fast) copied and still owed a
+        // read-back. Anything else is this destination's own failure.
+        let everyPairLanded = !outcomes.isEmpty && outcomes.allSatisfy {
+            $0?.isVerified == true || $0?.isTransferredPendingVerification == true
+        }
+        guard everyPairLanded else { return .failed }
+        let hasEvidence = report.manifestLocations.contains(destination)
+        switch report.status {
+        case .verified:
+            let everyPairVerified = outcomes.allSatisfy { $0?.isVerified == true }
+            return everyPairVerified && hasEvidence ? .verified : .transferNotVerified
+        case .transferredPendingVerification:
+            return hasEvidence ? .pendingVerification : .transferNotVerified
+        case .failed, .cancelled, .paused:
+            return .transferNotVerified
+        }
+    }
+
+    /// The red `transferNotVerified` text says what did happen here: every
+    /// copy was read back and matched, or (Fast) copies landed that nobody
+    /// read back. Neither wording is the success one.
+    nonisolated static func transferNotVerifiedText(of report: TransferReport, at destination: URL) -> String {
+        let everyPairVerified = !report.items.isEmpty
+            && report.items.allSatisfy { $0.outcomes[destination]?.isVerified == true }
+        return everyPairVerified
+            ? L10n.text("Copies verified · transfer not verified")
+            : L10n.text("Transferred · transfer not verified")
+    }
+
     func destinationFraction(_ destination: URL) -> Double {
         if let report {
-            guard planTotalBytes > 0 || !report.items.isEmpty else { return 0 }
-            let total = report.items.reduce(Int64(0)) { $0 + $1.item.size }
-            guard total > 0 else { return 0 }
-            let verified = report.items.reduce(Int64(0)) { value, item in
-                value + (item.outcomes[destination]?.isVerified == true ? item.item.size : 0)
-            }
-            return min(Double(verified) / Double(total), 1)
+            return Self.reportedFraction(of: report, at: destination)
         }
         switch progress.phase {
         case .enumerating:
@@ -491,13 +819,38 @@ final class TransferSession: Identifiable {
         }
     }
 
+    /// The terminal per-destination fraction. Both verified and
+    /// transferred-pending-verification bytes have landed, so both count —
+    /// the yellow state, not the number, says verification is still owed.
+    /// A destination with any failure keeps its shape: verified bytes only.
+    nonisolated static func reportedFraction(of report: TransferReport, at destination: URL) -> Double {
+        let total = report.items.reduce(Int64(0)) { $0 + $1.item.size }
+        guard total > 0 else { return 0 }
+        let hasFailure = report.items.contains {
+            if case .failed = $0.outcomes[destination] { return true } else { return false }
+        }
+        let landed = report.items.reduce(Int64(0)) { value, item in
+            guard let outcome = item.outcomes[destination] else { return value }
+            if outcome.isVerified { return value + item.item.size }
+            if !hasFailure, outcome.isTransferredPendingVerification { return value + item.item.size }
+            return value
+        }
+        return min(Double(landed) / Double(total), 1)
+    }
+
+    /// Windowed like the overall rate, with the same cumulative fallback.
     func destinationThroughput(_ destination: URL) -> Double {
         guard isRunning, let runStarted else { return 0 }
-        let elapsed = Date().timeIntervalSince(runStarted)
+        let now = Date()
+        if let windowed = ThroughputWindow.rate(
+            samples: destinationThroughputSamples[destination] ?? [],
+            now: now.timeIntervalSinceReferenceDate
+        ) {
+            return windowed
+        }
+        let elapsed = now.timeIntervalSince(runStarted)
         guard elapsed > 0.5 else { return 0 }
-        let bytes = (progress.copiedBytesByDestination[destination] ?? 0)
-            + (progress.verifiedBytesByDestination[destination] ?? 0)
-        return Double(bytes) / elapsed
+        return Double(destinationDoneBytes(destination)) / elapsed
     }
 
     func destinationETA(_ destination: URL) -> Double? {
@@ -505,9 +858,7 @@ final class TransferSession: Identifiable {
         guard rate > 0 else { return nil }
         let passes: Int64 = verificationProfile == .fast ? 1 : 2
         let total = planTotalBytes * passes
-        let done = (progress.copiedBytesByDestination[destination] ?? 0)
-            + (progress.verifiedBytesByDestination[destination] ?? 0)
-        return max(Double(total - done) / rate, 0)
+        return max(Double(total - destinationDoneBytes(destination)) / rate, 0)
     }
 
     func isBottleneck(_ destination: URL) -> Bool {
@@ -536,6 +887,9 @@ final class TransferSession: Identifiable {
         case .pendingVerification: return L10n.text("Transferred · verification pending")
         case .paused: return L10n.text("Paused · completed files retained")
         case .verified: return L10n.format("Verified · %@", errorText)
+        case .transferNotVerified:
+            // Only a terminal report produces this state.
+            return report.map { Self.transferNotVerifiedText(of: $0, at: destination) } ?? L10n.text("Incomplete")
         case .failed:
             return errors > 0 ? L10n.format("Failed · %@", errorText) : L10n.text("Incomplete")
         }
@@ -684,10 +1038,108 @@ final class TransferSession: Identifiable {
         return nil
     }
 
-    var canEjectSource: Bool {
-        guard report?.status == .verified, let sourceVolume else { return false }
-        return sourceVolume.isRemovable
-            && RealFileSystem().canonicalURL(source).path == sourceVolume.mountPath
+    // MARK: - Source eject
+
+    /// What the action row may offer for this attempt's source card. It runs
+    /// on every render of a verified card, so it reads only what is already
+    /// known: the volume watcher's list for the card mounted now, and what
+    /// each other attempt recorded at creation for the claims. Reading
+    /// `mounted` re-renders the card on every mount change, and a mount point
+    /// the watcher no longer lists counts as gone. `ejectSource` re-reads
+    /// everything before it unmounts.
+    func sourceEjectEligibility(
+        among sessions: [TransferSession],
+        mounted: [MountedVolume]
+    ) -> SourceEjectEligibility {
+        guard report?.status == .verified else { return .notOffered }
+        return evaluateSourceEject(
+            live: Self.watchedVolume(at: sourceVolume?.mountPath, among: mounted),
+            claims: sessions.filter { $0.id != id && $0.isActive }.map(\.recordedEjectClaim)
+        )
+    }
+
+    /// Re-reads the card at the recorded mount point and every other active
+    /// attempt's volumes, re-runs every check, and unmounts only when all of
+    /// them pass. Nothing suspends between the last check and `eject`.
+    func ejectSource(
+        among sessions: [TransferSession],
+        mounted: [MountedVolume],
+        eject: (URL) throws -> Void
+    ) -> SourceEjectOutcome {
+        let eligibility: SourceEjectEligibility = report?.status == .verified
+            ? evaluateSourceEject(
+                live: liveSourceVolume(mounted: mounted, fileSystem: RealFileSystem()),
+                claims: sessions.filter { $0.id != id && $0.isActive }.map(\.sourceEjectClaim)
+            )
+            : .notOffered
+        return SourceEjectGate.perform(eligibility, mountPath: sourceVolume?.mountPath, eject: eject)
+    }
+
+    private func evaluateSourceEject(
+        live: FileSystemVolume?,
+        claims: [SourceEjectClaim]
+    ) -> SourceEjectEligibility {
+        SourceEjectGate.evaluate(
+            sessionID: id,
+            verdict: report?.status,
+            sourcePath: RealFileSystem().canonicalURL(source).path,
+            recorded: sourceVolume,
+            live: live,
+            claims: claims
+        )
+    }
+
+    /// The storage this attempt holds while it is queued or running, re-read
+    /// now: every volume it touches and its resolved paths.
+    var sourceEjectClaim: SourceEjectClaim {
+        let fileSystem = RealFileSystem()
+        return SourceEjectClaim(
+            sessionID: id,
+            isActive: isActive,
+            volumeIdentifiers: resourceIDs.union(sourceVolume.map { [$0.identifier] } ?? []),
+            paths: ([source] + destinationBases).map { fileSystem.canonicalURL($0).path }
+        )
+    }
+
+    /// The same hold from what the attempt recorded at creation: its source
+    /// volume, and its paths standardized but not resolved. Cheap enough for
+    /// every render; a destination reached through another path is caught by
+    /// `sourceEjectClaim` at click time.
+    private var recordedEjectClaim: SourceEjectClaim {
+        SourceEjectClaim(
+            sessionID: id,
+            isActive: isActive,
+            volumeIdentifiers: sourceVolume.map { [$0.identifier] } ?? [],
+            paths: ([source] + destinationBases).map(\.standardizedFileURL.path)
+        )
+    }
+
+    /// The volume mounted at the recorded source mount point, re-read now.
+    private func liveSourceVolume(
+        mounted: [MountedVolume],
+        fileSystem: RealFileSystem
+    ) -> FileSystemVolume? {
+        guard let mountPath = sourceVolume?.mountPath,
+              mounted.contains(where: { $0.url.standardizedFileURL.path == mountPath })
+        else { return nil }
+        return try? fileSystem.volume(at: URL(fileURLWithPath: mountPath, isDirectory: true))
+    }
+
+    /// The volume the watcher lists at `mountPath`, in the shape the gate
+    /// compares. Its identity is the volume UUID, or the mount path when it
+    /// reports none, as `RealFileSystem` falls back; an unreported capacity
+    /// stays unknown rather than reading as zero.
+    nonisolated static func watchedVolume(at mountPath: String?, among mounted: [MountedVolume]) -> FileSystemVolume? {
+        guard let mountPath,
+              let volume = mounted.first(where: { $0.url.standardizedFileURL.path == mountPath })
+        else { return nil }
+        return FileSystemVolume(
+            identifier: volume.volumeIdentifier ?? mountPath,
+            name: volume.name,
+            mountPath: mountPath,
+            totalBytes: volume.totalBytes > 0 ? volume.totalBytes : nil,
+            isRemovable: volume.isRemovable
+        )
     }
 
     /// Removes only hidden staging files generated by this transfer ID. Final
@@ -726,5 +1178,64 @@ final class TransferSession: Identifiable {
         return base
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "com.lucastao.doppelganger", isDirectory: true)
             .appendingPathComponent("Transfers", isDirectory: true)
+    }
+}
+
+// MARK: - Sliding-window throughput
+
+/// One progress observation: seconds since the reference date, and the bytes
+/// finished at that moment.
+struct ThroughputSample: Equatable, Sendable {
+    let time: TimeInterval
+    let bytes: Int64
+}
+
+/// Pure arithmetic for a rate over the most recent few seconds of samples,
+/// so a display rate answers "how fast right now" rather than "how fast on
+/// average since launch".
+enum ThroughputWindow {
+    /// How far back the rate looks.
+    static let duration: TimeInterval = 5
+    /// Hard cap on retained samples; progress is throttled well below this
+    /// over a 5 s window, so the cap is only a guard.
+    static let maxSamples = 128
+
+    /// Bytes per second over the window ending at `now`, or `nil` when fewer
+    /// than two samples span a positive interval — callers fall back to the
+    /// cumulative rate then. The reference point is the newest sample at or
+    /// before `now - window`, or the oldest sample when none is that old, so
+    /// a young transfer still measures over everything it has.
+    static func rate(
+        samples: [ThroughputSample],
+        now: TimeInterval,
+        window: TimeInterval = duration
+    ) -> Double? {
+        guard samples.count >= 2, let latest = samples.last else { return nil }
+        let cutoff = now - window
+        let reference = samples.dropLast().last(where: { $0.time <= cutoff }) ?? samples[0]
+        guard reference.time < latest.time else { return nil }
+        let elapsed = max(now, latest.time) - reference.time
+        let delta = latest.bytes - reference.bytes
+        return max(Double(delta) / elapsed, 0)
+    }
+
+    /// Appends `sample` and prunes to what `rate` needs: everything inside
+    /// the window plus the single newest sample older than it.
+    static func appending(
+        _ sample: ThroughputSample,
+        to samples: [ThroughputSample],
+        now: TimeInterval,
+        window: TimeInterval = duration
+    ) -> [ThroughputSample] {
+        var kept = samples
+        kept.append(sample)
+        let cutoff = now - window
+        if let referenceIndex = kept.lastIndex(where: { $0.time <= cutoff }), referenceIndex > 0 {
+            kept.removeFirst(referenceIndex)
+        }
+        if kept.count > maxSamples {
+            kept.removeFirst(kept.count - maxSamples)
+        }
+        return kept
     }
 }
