@@ -4,7 +4,10 @@ struct VerificationReference: Sendable {
     struct Entry: Sendable {
         let relativePath: String
         let size: Int64
-        let digest: String
+        /// `nil` when the reference lists the file but holds no usable digest
+        /// for it (a doppelganger manifest item whose source was never read).
+        /// Such an entry is still expected in the folder and can never verify.
+        let digest: String?
     }
 
     let algorithm: ChecksumAlgorithm
@@ -18,11 +21,13 @@ struct VerificationReference: Sendable {
            let algorithm = manifest.algorithm == "xxh64"
                 ? ChecksumAlgorithm.xxh64
                 : ChecksumAlgorithm(rawValue: manifest.algorithm) {
-            let entries = manifest.items.compactMap { item -> Entry? in
-                guard let digest = item.digest else { return nil }
-                return Entry(relativePath: item.relativePath, size: item.size, digest: digest)
+            // Every listed item stays expected. Dropping digest-less items
+            // (never read by a paused, cancelled, or failed attempt) would let
+            // their absence from the folder pass unnoticed.
+            let entries = manifest.items.map {
+                Entry(relativePath: $0.relativePath, size: $0.size, digest: $0.digest)
             }
-            guard !entries.isEmpty else { throw MHLReadError.noHashes }
+            guard entries.contains(where: { $0.digest != nil }) else { throw MHLReadError.noHashes }
             return VerificationReference(
                 algorithm: algorithm,
                 entries: entries,
@@ -31,6 +36,24 @@ struct VerificationReference: Sendable {
         }
 
         let document = try MHLReader.read(data)
+        // A record the MHL marks "failed" holds the hash of bytes already
+        // proven wrong; using it as the expected value would verify the damage
+        // against itself. Refuse the whole reference and name the file.
+        let untrusted = document.entries.compactMap { entry in
+            entry.untrustedHashAction.map { (path: entry.relativePath, action: $0) }
+        }
+        if let first = untrusted.first {
+            throw MHLReadError.untrustedHashRecord(
+                path: first.path,
+                action: first.action,
+                recordCount: untrusted.count
+            )
+        }
+        // A <hash> record the reader could not use still names a file. Refuse
+        // the list rather than let that file's absence go unnoticed.
+        guard document.unusableHashRecordCount == 0 else {
+            throw MHLReadError.unverifiableHashRecords
+        }
         let preference: [ChecksumAlgorithm] = [.xxh3, .xxh64, .md5]
         guard let algorithm = preference.first(where: { candidate in
             document.entries.allSatisfy { $0.digests[candidate] != nil }
@@ -91,7 +114,7 @@ enum StandaloneVerificationService {
                         let observed = try fileSystem.sourceItem(at: target, relativeTo: mediaRoot)
                         if observed.size != entry.size {
                             outcome = .failed(.sizeMismatch(expected: entry.size, actual: observed.size))
-                        } else {
+                        } else if let expected = entry.digest {
                             let stream = try fileSystem.openForReading(target, uncached: true)
                             defer { stream.close() }
                             var hasher = reference.algorithm.makeHasher()
@@ -103,9 +126,14 @@ enum StandaloneVerificationService {
                                 }
                             }
                             let actual = hasher.hexDigest()
-                            outcome = actual == entry.digest
+                            outcome = actual == expected
                                 ? .verified
-                                : .failed(.checksumMismatch(expected: entry.digest, actual: actual))
+                                : .failed(.checksumMismatch(expected: expected, actual: actual))
+                        } else {
+                            // Present at the listed size, but the reference
+                            // recorded no digest, so nothing proves these are
+                            // the source's bytes.
+                            outcome = .failed(.noReferenceDigest)
                         }
                     } catch {
                         outcome = .failed(.sourceUnreadable(detail: error.localizedDescription))

@@ -939,8 +939,36 @@ final class AppModel {
             )
             return report
         } catch {
-            productStore.reportError(L10n.format("Standalone verification failed: %@", error.localizedDescription))
-            throw error
+            // The attempt was registered, so it must not stay "copying" in the
+            // catalog: record it as failed, with the reason.
+            let message: String = if case FileSystemError.notReadable(let detail) = error {
+                L10n.format("The media folder could not be read completely: %@", detail)
+            } else {
+                error.localizedDescription
+            }
+            productStore.finishAttempt(
+                id: id,
+                taskID: id,
+                report: TransferReport(
+                    id: id,
+                    status: .failed,
+                    algorithm: reference.algorithm,
+                    verificationProfile: .standard,
+                    taskID: id,
+                    operatorSnapshot: OperatorSnapshot(profile: profile),
+                    projectID: selectedProjectID,
+                    sourceRoot: mediaRoot,
+                    destinations: [mediaRoot],
+                    startedAt: Date(),
+                    finishedAt: Date(),
+                    items: [],
+                    manifestLocations: [],
+                    issues: [message]
+                ),
+                verificationProfile: .standard
+            )
+            productStore.reportError(L10n.format("Standalone verification failed: %@", message))
+            throw VerifyExistingFailure(message: message)
         }
     }
 
@@ -1035,4 +1063,11 @@ final class AppModel {
     private func persistDraft() {
         selectionStore.save(source: draftSource, destinations: draftDestinations)
     }
+}
+
+/// A Verify Existing Media run that could not produce a report, with the
+/// reason worded for the operator.
+struct VerifyExistingFailure: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }

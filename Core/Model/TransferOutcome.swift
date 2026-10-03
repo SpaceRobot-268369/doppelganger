@@ -14,6 +14,9 @@ public enum ItemFailureReason: Sendable, Hashable {
     case nameCollision
     case writeFailed(detail: String)
     case cancelled
+    /// Standalone verification: the reference lists this file but holds no
+    /// usable digest for it, so its bytes cannot be proven.
+    case noReferenceDigest
 
     /// Stable machine-readable slug recorded in the manifest.
     public var slug: String {
@@ -31,6 +34,7 @@ public enum ItemFailureReason: Sendable, Hashable {
         case .nameCollision: "name-collision"
         case .writeFailed: "write-failed"
         case .cancelled: "cancelled"
+        case .noReferenceDigest: "no-reference-digest"
         }
     }
 
