@@ -270,10 +270,19 @@ struct TransferPreflight: Sendable, Equatable {
                 }
                 let available = volume?.availableBytes ?? (try? fileSystem.freeSpace(at: base))
                 let reserve = max(Int64(512 * 1024 * 1024), total / 20)
-                if duplicateManifest == nil, let available, available < total + reserve {
+                // A prior verified manifest only excuses the files it can
+                // plausibly prove; the rest of the plan still needs room. A
+                // plan it covers entirely needs none here; the engine
+                // re-checks capacity once it knows what it must write.
+                let candidateBytes = duplicateManifest.map {
+                    duplicateCandidateBytes(items: items, manifest: $0, output: output)
+                } ?? 0
+                let remainder = total - candidateBytes
+                let needed = remainder + reserve
+                if remainder > 0, let available, available < needed {
                     blocking.append(
                         "Not enough working space on \(volume?.name ?? base.lastPathComponent): "
-                        + "needs \(Format.bytes(total + reserve)), has \(Format.bytes(available))."
+                        + "needs \(Format.bytes(needed)), has \(Format.bytes(available))."
                     )
                 }
                 if let sourceVolume, let volume, sourceVolume.identifier == volume.identifier {
@@ -376,6 +385,31 @@ struct TransferPreflight: Sendable, Equatable {
             candidates.append(manifest)
         }
         return candidates.sorted { $0.finishedAt > $1.finishedAt }.first
+    }
+
+    /// Bytes a prior verified manifest might let the engine skip at `output`:
+    /// same relative path and size, a recorded digest, and a verified result
+    /// there. The engine re-hashes before skipping anything, and re-checks
+    /// capacity against the exact remainder once it has.
+    static func duplicateCandidateBytes(
+        items: [SourceItem],
+        manifest: TransferManifest,
+        output: URL
+    ) -> Int64 {
+        let records = Dictionary(
+            manifest.items.map { ($0.relativePath, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return items.reduce(Int64(0)) { sum, item in
+            guard let record = records[item.relativePath],
+                  record.size == item.size,
+                  record.digest != nil,
+                  record.results.contains(where: {
+                      $0.destination == output.path && $0.status == "verified"
+                  })
+            else { return sum }
+            return sum + item.size
+        }
     }
 
     /// Stable identity of the reviewed source plan. Paths, sizes, and source

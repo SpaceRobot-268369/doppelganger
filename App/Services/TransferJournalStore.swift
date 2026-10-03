@@ -37,6 +37,18 @@ struct TransferJournal: Codable, Sendable, Identifiable {
     var itemCount: Int
     var totalBytes: Int64
     var status: Status
+    /// ASC MHL generations this run appended, recorded so an interrupted
+    /// finalization can be rolled back; generation filenames alone do not
+    /// carry the transfer id. Optional so journals written before this key
+    /// existed still decode (synthesized Codable ignores property defaults).
+    var mhlGenerations: [MHLGenerationRecord]? = nil
+}
+
+struct MHLGenerationRecord: Codable, Sendable, Equatable {
+    let destination: URL
+    let generationURL: URL
+    let chainURL: URL
+    let archiveURL: URL?
 }
 
 /// Journals live beside the transfer log and evidence spool. Writes are
@@ -121,6 +133,18 @@ struct TransferJournalStore {
                     try? fileManager.removeItem(at: url)
                 }
             }
+        }
+        // The engine only reports generations once every destination's
+        // append succeeded, so each one here was fully written; what never
+        // happened is the terminal verdict that would justify keeping it.
+        let fileSystem = RealFileSystem()
+        for generation in journal.mhlGenerations ?? [] {
+            MHLHistoryStore.rollbackUncommitted(
+                generationURL: generation.generationURL,
+                chainURL: generation.chainURL,
+                archiveURL: generation.archiveURL,
+                fileSystem: fileSystem
+            )
         }
     }
 }

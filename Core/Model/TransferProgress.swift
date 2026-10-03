@@ -26,6 +26,9 @@ public struct TransferProgress: Sendable {
     public var itemsCopied: Int
     /// Bytes re-read and hashed so far at each destination during verify.
     public var verifiedBytesByDestination: [URL: Int64]
+    /// Maximum profile only: source bytes hashed by the independent pre-read
+    /// pass, which is its own leg of the work budget.
+    public var preReadBytes: Int64 = 0
     public var currentRelativePath: String?
 
     public init(
@@ -36,6 +39,7 @@ public struct TransferProgress: Sendable {
         copiedBytesByDestination: [URL: Int64] = [:],
         itemsCopied: Int = 0,
         verifiedBytesByDestination: [URL: Int64] = [:],
+        preReadBytes: Int64 = 0,
         currentRelativePath: String? = nil
     ) {
         self.phase = phase
@@ -45,6 +49,7 @@ public struct TransferProgress: Sendable {
         self.copiedBytesByDestination = copiedBytesByDestination
         self.itemsCopied = itemsCopied
         self.verifiedBytesByDestination = verifiedBytesByDestination
+        self.preReadBytes = preReadBytes
         self.currentRelativePath = currentRelativePath
     }
 }
