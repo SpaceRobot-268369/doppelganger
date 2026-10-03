@@ -54,6 +54,20 @@ actor ProgressHub {
         emit(force: false)
     }
 
+    func addPreReadBytes(_ count: Int) {
+        progress.preReadBytes += Int64(count)
+        emit(force: false)
+    }
+
+    func mhlGenerationWritten(destination: URL, generationURL: URL, chainURL: URL, archiveURL: URL?) {
+        continuation.yield(.mhlGenerationWritten(
+            destination: destination,
+            generationURL: generationURL,
+            chainURL: chainURL,
+            archiveURL: archiveURL
+        ))
+    }
+
     func outcome(_ relativePath: String, destination: URL, _ outcome: ItemDestinationOutcome) {
         continuation.yield(.itemOutcome(relativePath: relativePath, destination: destination, outcome: outcome))
     }

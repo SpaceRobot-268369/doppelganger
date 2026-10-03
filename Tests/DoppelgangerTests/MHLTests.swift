@@ -11,7 +11,7 @@ struct MHLTests {
         #expect(xml.contains("<process>transfer</process>"))
         #expect(xml.contains("<roothash>"))
         #expect(xml.contains("<directoryhash>"))
-        #expect(xml.contains(#"<xxh64 action="verified" hashdate="2025-08-09T00:44:02.500Z">0123456789abcdef</xxh64>"#))
+        #expect(xml.contains(#"<xxh64 action="original" hashdate="2025-08-09T00:44:02.500Z">0123456789abcdef</xxh64>"#))
 
         let document = try MHLReader.read(Data(xml.utf8))
         #expect(document.version == "2.0")
@@ -151,5 +151,16 @@ struct MHLTests {
                 .appendingPathComponent("chain-history")
                 .appendingPathComponent("ascmhl_chain_before_0002.xml").path
         ))
+        // The first sighting of each path is its original; the re-check is a
+        // verification. Neither file is on disk in this fixture, so neither
+        // generation may claim a root hash over the folder.
+        let generations = try chain.entries.map {
+            try String(contentsOf: directory.appendingPathComponent($0.path), encoding: .utf8)
+        }
+        #expect(generations[0].components(separatedBy: #"action="original""#).count - 1 == 2)
+        #expect(!generations[0].contains(#"action="verified""#))
+        #expect(generations[1].components(separatedBy: #"action="verified""#).count - 1 == 2)
+        #expect(!generations[1].contains(#"action="original""#))
+        #expect(!generations.contains { $0.contains("<roothash>") })
     }
 }

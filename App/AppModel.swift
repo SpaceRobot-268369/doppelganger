@@ -375,16 +375,16 @@ final class AppModel {
         switch filter {
         case .all: sessions
         case .active: sessions.filter(\.isActive)
-        case .attention: sessions.filter { $0.report?.status != .verified && !$0.isActive }
+        case .attention: sessions.filter(\.needsAttention)
         case .verified: sessions.filter { $0.report?.status == .verified }
         }
     }
 
     var activeCount: Int { sessions.filter(\.isActive).count }
     var completeCount: Int { sessions.count - activeCount }
-    var attentionCount: Int {
-        sessions.filter { $0.report?.status != .verified && !$0.isActive }.count
-    }
+    /// Shares `TransferSession.needsAttention` with the filter chip and the
+    /// sidebar footer so the three never disagree about what is a problem.
+    var attentionCount: Int { sessions.filter(\.needsAttention).count }
     var verifiedCount: Int { sessions.filter { $0.report?.status == .verified }.count }
     var runningCount: Int { sessions.filter(\.isRunning).count }
 
@@ -449,10 +449,11 @@ final class AppModel {
     var totalPlannedBytes: Int64 { sessions.reduce(0) { $0 + $1.planTotalBytes } }
     var aggregateThroughput: Double { sessions.reduce(0) { $0 + $1.throughputBytesPerSecond } }
 
-    /// Quiet green only while nothing has failed; a failed or cancelled
-    /// transfer flips the footer to a loud warning until its card is dismissed.
+    /// Quiet only while no session needs attention — a live failure, a failed
+    /// or cancelled verdict, or a copy still awaiting verification flips the
+    /// footer to a loud warning until its card is dismissed or verified.
     var systemNominal: Bool {
-        !sessions.contains { $0.hasAttention }
+        !sessions.contains(where: \.needsAttention)
     }
 
     func remove(_ session: TransferSession) {
@@ -1419,8 +1420,36 @@ final class AppModel {
             )
             return report
         } catch {
-            productStore.reportError(L10n.format("Standalone verification failed: %@", error.localizedDescription))
-            throw error
+            // The attempt was registered, so it must not stay "copying" in the
+            // catalog: record it as failed, with the reason.
+            let message: String = if case FileSystemError.notReadable(let detail) = error {
+                L10n.format("The media folder could not be read completely: %@", detail)
+            } else {
+                error.localizedDescription
+            }
+            productStore.finishAttempt(
+                id: id,
+                taskID: id,
+                report: TransferReport(
+                    id: id,
+                    status: .failed,
+                    algorithm: reference.algorithm,
+                    verificationProfile: .standard,
+                    taskID: id,
+                    operatorSnapshot: OperatorSnapshot(profile: profile),
+                    projectID: selectedProjectID,
+                    sourceRoot: mediaRoot,
+                    destinations: [mediaRoot],
+                    startedAt: Date(),
+                    finishedAt: Date(),
+                    items: [],
+                    manifestLocations: [],
+                    issues: [message]
+                ),
+                verificationProfile: .standard
+            )
+            productStore.reportError(L10n.format("Standalone verification failed: %@", message))
+            throw VerifyExistingFailure(message: message)
         }
     }
 
@@ -1515,4 +1544,11 @@ final class AppModel {
     private func persistDraft() {
         selectionStore.save(source: draftSource, destinations: draftDestinations)
     }
+}
+
+/// A Verify Existing Media run that could not produce a report, with the
+/// reason worded for the operator.
+struct VerifyExistingFailure: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }

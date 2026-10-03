@@ -136,10 +136,10 @@ struct TransferPreflight: Sendable, Equatable {
         folderName rawName: String,
         algorithm: ChecksumAlgorithm = .xxh3,
         layout: DestinationLayout = .newFolder,
-        includedRelativePaths: Set<String>? = nil
+        includedRelativePaths: Set<String>? = nil,
+        fileSystem: any FileSystemAccess = RealFileSystem()
     ) async -> Self {
         await Task.detached(priority: .userInitiated) {
-            let fileSystem = RealFileSystem()
             let folderName = validFolderName(rawName)
             var blocking: [String] = []
             var warnings: [String] = []
@@ -184,6 +184,9 @@ struct TransferPreflight: Sendable, Equatable {
                     )
                 }
                 if items.isEmpty, blocking.isEmpty { blocking.append("The source is empty.") }
+            } catch FileSystemError.notReadable(let detail) {
+                // A partial scan must never become a smaller, clean-looking plan.
+                blocking.append(L10n.format("The source could not be read completely: %@", detail))
             } catch {
                 blocking.append("The source could not be scanned: \(error)")
             }
@@ -214,7 +217,7 @@ struct TransferPreflight: Sendable, Equatable {
             }
             var reviewedDestinations: [Destination] = []
             var seenPaths = Set<String>()
-            var destinationVolumes: [String: [String]] = [:]
+            var independenceEntries: [(name: String, volume: FileSystemVolume?)] = []
 
             for base in destinationBases {
                 let canonicalBase = fileSystem.canonicalURL(base)
@@ -270,24 +273,48 @@ struct TransferPreflight: Sendable, Equatable {
                 }
                 let available = volume?.availableBytes ?? (try? fileSystem.freeSpace(at: base))
                 let reserve = max(Int64(512 * 1024 * 1024), total / 20)
-                if duplicateManifest == nil, let available, available < total + reserve {
+                // A prior verified manifest only excuses the files it can
+                // plausibly prove; the rest of the plan still needs room. A
+                // plan it covers entirely needs none here; the engine
+                // re-checks capacity once it knows what it must write.
+                let candidateBytes = duplicateManifest.map {
+                    duplicateCandidateBytes(items: items, manifest: $0, output: output)
+                } ?? 0
+                let remainder = total - candidateBytes
+                let needed = remainder + reserve
+                if remainder > 0, let available, available < needed {
                     blocking.append(
                         "Not enough working space on \(volume?.name ?? base.lastPathComponent): "
-                        + "needs \(Format.bytes(total + reserve)), has \(Format.bytes(available))."
+                        + "needs \(Format.bytes(needed)), has \(Format.bytes(available))."
                     )
                 }
-                if let sourceVolume, let volume, sourceVolume.identifier == volume.identifier {
+                // Independence is a property of physical devices: two APFS
+                // volumes or partitions on one disk are one failure domain.
+                // The engine's own veto repeats this device check; the queue's
+                // contention keys still compare volume identifiers.
+                if let sourceVolume, let volume, sourceVolume.sharesPhysicalDevice(with: volume) {
+                    let sameVolume = sourceVolume.identifier == volume.identifier
                     let sourceIsMountedRoot = sourceCanonical.path == sourceVolume.mountPath
                     if sourceIsMountedRoot && sourceVolume.isRemovable {
-                        blocking.append("A camera-card source cannot also be its own destination volume.")
+                        // Formatting a card in camera rewrites the whole device,
+                        // so another partition on it is no backup either.
+                        blocking.append(sameVolume
+                            ? L10n.text("A camera-card source cannot also be its own destination volume.")
+                            : L10n.text("A camera-card source cannot share its physical device with a destination."))
                     } else {
-                        warnings.append(
-                            "\(base.lastPathComponent) is on the same volume as the source; this is not an independent backup."
-                        )
+                        warnings.append(sameVolume
+                            ? L10n.format(
+                                "%@ is on the same volume as the source; this is not an independent backup.",
+                                base.lastPathComponent
+                            )
+                            : L10n.format(
+                                "%@ is on the same physical device as the source; this is not an independent backup.",
+                                base.lastPathComponent
+                            ))
                     }
                 }
+                independenceEntries.append((base.lastPathComponent, volume))
                 if let volume {
-                    destinationVolumes[volume.identifier, default: []].append(base.lastPathComponent)
                     blocking.append(contentsOf: compatibilityIssues(
                         items: items,
                         output: output,
@@ -303,11 +330,10 @@ struct TransferPreflight: Sendable, Equatable {
                 ))
             }
 
-            for names in destinationVolumes.values where names.count > 1 {
-                warnings.append(
-                    "\(names.joined(separator: " and ")) share one physical volume; they are not independent copies."
-                )
-            }
+            warnings.append(contentsOf: independenceWarnings(
+                source: (source.lastPathComponent, sourceVolume),
+                destinations: independenceEntries
+            ))
 
             if layout == .directly, !reviewedDestinations.isEmpty {
                 notices.append(
@@ -352,6 +378,40 @@ struct TransferPreflight: Sendable, Equatable {
             .sorted()
     }
 
+    /// Destinations that are not independent of each other, and every
+    /// participant whose physical device is unknown. Grouping is transitive
+    /// over "same volume or same device". Unknown is never independent: it
+    /// needs the same acknowledgement as a known share.
+    static func independenceWarnings(
+        source: (name: String, volume: FileSystemVolume?),
+        destinations: [(name: String, volume: FileSystemVolume?)]
+    ) -> [String] {
+        guard !destinations.isEmpty else { return [] }
+        var warnings: [String] = []
+        var groups: [[(name: String, volume: FileSystemVolume)]] = []
+        for case let (name, volume?) in destinations {
+            let joined = groups.indices.filter { index in
+                groups[index].contains { $0.volume.sharesPhysicalDevice(with: volume) }
+            }
+            let merged = joined.flatMap { groups[$0] } + [(name: name, volume: volume)]
+            for index in joined.reversed() { groups.remove(at: index) }
+            groups.append(merged)
+        }
+        for group in groups where group.count > 1 {
+            warnings.append(L10n.format(
+                "%@ share one physical volume; they are not independent copies.",
+                ListFormatter.localizedString(byJoining: group.map { $0.name })
+            ))
+        }
+        for participant in [source] + destinations where participant.volume?.physicalDeviceIdentifier == nil {
+            warnings.append(L10n.format(
+                "Could not identify the physical device behind %@; the copies cannot be confirmed as independent.",
+                participant.name
+            ))
+        }
+        return warnings
+    }
+
     private static func verifiedDuplicateCandidate(
         at output: URL,
         sourceFingerprint: String,
@@ -376,6 +436,31 @@ struct TransferPreflight: Sendable, Equatable {
             candidates.append(manifest)
         }
         return candidates.sorted { $0.finishedAt > $1.finishedAt }.first
+    }
+
+    /// Bytes a prior verified manifest might let the engine skip at `output`:
+    /// same relative path and size, a recorded digest, and a verified result
+    /// there. The engine re-hashes before skipping anything, and re-checks
+    /// capacity against the exact remainder once it has.
+    static func duplicateCandidateBytes(
+        items: [SourceItem],
+        manifest: TransferManifest,
+        output: URL
+    ) -> Int64 {
+        let records = Dictionary(
+            manifest.items.map { ($0.relativePath, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return items.reduce(Int64(0)) { sum, item in
+            guard let record = records[item.relativePath],
+                  record.size == item.size,
+                  record.digest != nil,
+                  record.results.contains(where: {
+                      $0.destination == output.path && $0.status == "verified"
+                  })
+            else { return sum }
+            return sum + item.size
+        }
     }
 
     /// Stable identity of the reviewed source plan. Paths, sizes, and source

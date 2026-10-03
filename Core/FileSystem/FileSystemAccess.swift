@@ -14,6 +14,15 @@ public struct FileSystemVolume: Sendable, Hashable, Codable {
     public let supportsCaseSensitiveNames: Bool?
     public let maximumNameBytes: Int?
     public let maximumPathBytes: Int?
+    /// The physical failure domain behind this volume, used only to decide
+    /// whether copies are independent: `disk:<bsd>@<registry id>` for the
+    /// whole physical disk an APFS container or partition lives on, or
+    /// `net:<server>` for a network share. Volumes with different
+    /// `identifier`s can share it — two APFS volumes or partitions on one
+    /// disk, two shares from one server. `nil` when the platform could not
+    /// establish it; independence checks then treat the volume as unproven,
+    /// never as independent. Valid for this boot only; never persist it.
+    public let physicalDeviceIdentifier: String?
 
     public init(
         identifier: String,
@@ -26,7 +35,8 @@ public struct FileSystemVolume: Sendable, Hashable, Codable {
         isReadOnly: Bool = false,
         supportsCaseSensitiveNames: Bool? = nil,
         maximumNameBytes: Int? = nil,
-        maximumPathBytes: Int? = nil
+        maximumPathBytes: Int? = nil,
+        physicalDeviceIdentifier: String? = nil
     ) {
         self.identifier = identifier
         self.name = name
@@ -39,7 +49,18 @@ public struct FileSystemVolume: Sendable, Hashable, Codable {
         self.supportsCaseSensitiveNames = supportsCaseSensitiveNames
         self.maximumNameBytes = maximumNameBytes
         self.maximumPathBytes = maximumPathBytes
+        self.physicalDeviceIdentifier = physicalDeviceIdentifier
     }
+}
+
+/// How hard a write stream's `close()` pushes bytes toward the platter.
+/// `standard` is `fsync(2)`, which on macOS flushes the kernel's buffers but
+/// leaves the drive's own write cache alone; `full` is `F_FULLFSYNC`, which
+/// asks the drive to commit as well and is what the Maximum verification
+/// profile uses for media staging files.
+public enum WriteDurability: Sendable, Equatable {
+    case standard
+    case full
 }
 
 /// Core's only window onto storage. Platform implements it with real POSIX
@@ -48,7 +69,13 @@ public struct FileSystemVolume: Sendable, Hashable, Codable {
 public protocol FileSystemAccess: Sendable {
     /// Recursively list regular files under `root`, relative paths preserved,
     /// in a deterministic sorted order. Must never mutate anything beneath
-    /// `root` — the source stays read-only, `.DS_Store` included.
+    /// `root` — the source stays read-only, `.DS_Store` included. Symbolic
+    /// links are not media and are not followed outside `root`. Never
+    /// returns a partial list: if any part of the tree outside known
+    /// operating-system metadata cannot be read, throw
+    /// `FileSystemError.notReadable` (or `.volumeGone` if the root itself
+    /// vanished). Preflight, the engine plan and the post-transfer rescan
+    /// treat the result as the complete source.
     func enumerate(root: URL) throws -> [SourceItem]
 
     /// Resolve aliases/symlinks for safety comparisons. For a not-yet-created
@@ -72,7 +99,8 @@ public protocol FileSystemAccess: Sendable {
 
     /// Open a brand-new file for writing (exclusive create). An existing file
     /// throws `FileSystemError.alreadyExists` — the engine's name collision.
-    func openForWritingExclusive(_ url: URL) throws -> any FileWriteStream
+    /// `durability` decides how far `close()` flushes; see `WriteDurability`.
+    func openForWritingExclusive(_ url: URL, durability: WriteDurability) throws -> any FileWriteStream
 
     /// Atomically publish a fully flushed staging file without overwriting an
     /// existing final path.
@@ -93,6 +121,14 @@ public protocol FileSystemAccess: Sendable {
 
     /// Free bytes on the volume containing `url`.
     func freeSpace(at url: URL) throws -> Int64
+}
+
+public extension FileSystemAccess {
+    /// Standard-durability exclusive create; evidence files and non-Maximum
+    /// media use this.
+    func openForWritingExclusive(_ url: URL) throws -> any FileWriteStream {
+        try openForWritingExclusive(url, durability: .standard)
+    }
 }
 
 public protocol FileReadStream: AnyObject {

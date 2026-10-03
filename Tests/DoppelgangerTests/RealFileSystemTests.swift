@@ -70,6 +70,30 @@ struct RealFileSystemTests {
         }
     }
 
+    @Test func fullDurabilityWriteReadsBackIdentically() throws {
+        let fixtures = try FixtureBuilder()
+        let destination = try fixtures.makeDestination(named: "dest")
+        let fileURL = destination.appendingPathComponent("durable.bin")
+        let payload = SplitMix64.bytes(count: 70_000, seed: 11)
+
+        // F_FULLFSYNC on close (with the fsync fallback for filesystems that
+        // refuse it) must still produce exactly the written bytes.
+        let writer = try fs.openForWritingExclusive(fileURL, durability: .full)
+        try writer.write(payload, count: payload.count)
+        try writer.close()
+
+        let reader = try fs.openForReading(fileURL, uncached: true)
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        var collected: [UInt8] = []
+        while true {
+            let count = try reader.read(into: &buffer)
+            if count == 0 { break }
+            collected.append(contentsOf: buffer[0..<count])
+        }
+        reader.close()
+        #expect(collected == payload)
+    }
+
     @Test func exclusiveCreateThrowsOnCollision() throws {
         let fixtures = try FixtureBuilder()
         let destination = try fixtures.makeDestination(named: "dest")

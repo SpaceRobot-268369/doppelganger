@@ -42,8 +42,9 @@ private struct DockIconView: View {
                 .frame(height: 13)
                 .overlay(alignment: .leading) {
                     GeometryReader { geometry in
+                        // Blue is "copying"; green is reserved for verified.
                         Capsule()
-                            .fill(.green)
+                            .fill(.blue)
                             .frame(width: max(geometry.size.width * fraction, 12))
                     }
                     .padding(2)

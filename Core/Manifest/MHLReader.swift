@@ -7,7 +7,26 @@ public struct MHLDocument: Sendable, Hashable {
         public let digests: [ChecksumAlgorithm: String]
         public let hashDate: String?
         public let modifiedAt: String?
-        public let action: String?
+        /// The `action` attribute of every hash element in this record,
+        /// trimmed and lowercased, in document order — including hash formats
+        /// this reader does not support. Empty for MHL v1 and unannotated
+        /// records.
+        public let hashActions: [String]
+
+        /// ASC MHL hash actions under which a record's digests may serve as
+        /// an expected value. ascmhl also writes `new` for a hash format
+        /// added to a file whose history already holds another format.
+        public static let trustedHashActions: Set<String> = ["original", "verified", "new"]
+
+        /// The action that disqualifies this record as a reference, or nil.
+        /// ascmhl records `failed` together with the newly computed (bad)
+        /// value when a read does not match the history, and every other hash
+        /// in that record was taken from the same bytes, so the whole record
+        /// is untrusted. An unrecognized action is treated the same way.
+        public var untrustedHashAction: String? {
+            hashActions.first { $0 == "failed" }
+                ?? hashActions.first { !Self.trustedHashActions.contains($0) }
+        }
 
         public init(
             relativePath: String,
@@ -15,14 +34,14 @@ public struct MHLDocument: Sendable, Hashable {
             digests: [ChecksumAlgorithm: String],
             hashDate: String? = nil,
             modifiedAt: String? = nil,
-            action: String? = nil
+            hashActions: [String] = []
         ) {
             self.relativePath = relativePath
             self.size = size
             self.digests = digests
             self.hashDate = hashDate
             self.modifiedAt = modifiedAt
-            self.action = action
+            self.hashActions = hashActions
         }
     }
 
@@ -40,6 +59,12 @@ public struct MHLDocument: Sendable, Hashable {
     public let creationDate: String?
     public let sourcePlanFingerprint: String?
     public let mediaVolumeIdentifier: String?
+    /// `<hash>` records the reader could not turn into an `Entry` (no path,
+    /// no parsable size, or no digest in a supported algorithm). They stay
+    /// out of `entries`, so chain validation and source trust are unchanged,
+    /// but a verifier must not mistake those files for ones the list never
+    /// named.
+    public let unusableHashRecordCount: Int
 }
 
 public struct MHLChainDocument: Sendable, Hashable {
@@ -69,7 +94,8 @@ public enum MHLReader {
             rootStructureDigests: delegate.rootStructureDigests,
             creationDate: delegate.creationDate,
             sourcePlanFingerprint: delegate.sourcePlanFingerprint,
-            mediaVolumeIdentifier: delegate.mediaVolumeIdentifier
+            mediaVolumeIdentifier: delegate.mediaVolumeIdentifier,
+            unusableHashRecordCount: delegate.unusableHashRecordCount
         )
     }
 
@@ -126,6 +152,7 @@ public enum MHLReader {
         var creationDate: String?
         var sourcePlanFingerprint: String?
         var mediaVolumeIdentifier: String?
+        var unusableHashRecordCount = 0
 
         private enum RecordKind { case none, file, directory, root }
         private enum DigestContainer { case none, content, structure }
@@ -139,7 +166,7 @@ public enum MHLReader {
         private var structureDigests: [ChecksumAlgorithm: String] = [:]
         private var hashDate: String?
         private var modifiedAt: String?
-        private var action: String?
+        private var hashActions: [String] = []
 
         func parser(
             _ parser: XMLParser,
@@ -159,7 +186,7 @@ public enum MHLReader {
                 digests = [:]
                 hashDate = nil
                 modifiedAt = nil
-                action = nil
+                hashActions = []
             case "directoryhash":
                 recordKind = .directory
                 path = nil
@@ -178,9 +205,16 @@ public enum MHLReader {
                 sourcePlanFingerprint = attributes["sourceplanfingerprint"]
                 mediaVolumeIdentifier = attributes["volumeidentifier"]
             default:
-                if algorithm(for: element) != nil, recordKind == .file {
-                    hashDate = attributes["hashdate"] ?? hashDate
-                    action = attributes["action"] ?? action
+                if recordKind == .file {
+                    // Every hash element's action counts, even for a format
+                    // this reader cannot use: a `failed` on any of them
+                    // taints the record.
+                    if let action = attributes["action"] {
+                        hashActions.append(action.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+                    }
+                    if algorithm(for: element) != nil {
+                        hashDate = attributes["hashdate"] ?? hashDate
+                    }
                 }
             }
         }
@@ -223,8 +257,10 @@ public enum MHLReader {
                         digests: digests,
                         hashDate: hashDate,
                         modifiedAt: modifiedAt,
-                        action: action
+                        hashActions: hashActions
                     ))
+                } else {
+                    unusableHashRecordCount += 1
                 }
                 recordKind = .none
             case "directoryhash":
@@ -306,9 +342,30 @@ public enum MHLReadError: LocalizedError {
     case inconsistentAlgorithms
     case invalidChain
     case chainDigestMismatch(path: String)
+    /// A `<hash>` record names a file but has no size or no supported digest.
+    case unverifiableHashRecords
+    /// A record whose hash the MHL marks `failed` (or with an unrecognized
+    /// action) cannot be the expected value.
+    case untrustedHashRecord(path: String, action: String, recordCount: Int)
+
+    static let unverifiableHashRecordsKey = "The MHL lists files without a size or a supported checksum (XXH3-64, XXH64BE, MD5), so it cannot prove this folder is complete."
+    static let untrustedHashRecordKey = "This MHL marks the hash of %@ as “%@”, so it cannot be used as a reference. Choose the MHL generation that recorded the original hashes."
+    static let untrustedHashRecordsKey = "This MHL marks the hash of %@ as “%@” (%lld files in total), so it cannot be used as a reference. Choose the MHL generation that recorded the original hashes."
 
     public var errorDescription: String? {
         switch self {
+        case .unverifiableHashRecords:
+            NSLocalizedString(Self.unverifiableHashRecordsKey, comment: "Verify Existing Media: reference MHL has unusable hash records")
+        case .untrustedHashRecord(let path, let action, let recordCount):
+            recordCount == 1
+                ? String(
+                    format: NSLocalizedString(Self.untrustedHashRecordKey, comment: "Verify Existing Media: reference MHL holds a failed hash record"),
+                    locale: .current, path, action
+                )
+                : String(
+                    format: NSLocalizedString(Self.untrustedHashRecordsKey, comment: "Verify Existing Media: reference MHL holds failed hash records"),
+                    locale: .current, path, action, Int64(recordCount)
+                )
         case .invalidDocument: "The MHL XML is not valid."
         case .noHashes: "The MHL contains no supported file hashes."
         case .inconsistentAlgorithms: "The MHL does not provide one supported algorithm for every file."

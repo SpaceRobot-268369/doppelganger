@@ -2,6 +2,7 @@
 "Transfers" = "传输";
 "Sources" = "来源";
 "Destinations" = "目的地";
+"Storage" = "存储";
 "Projects" = "项目";
 "Manifests" = "清单";
 "Compare" = "比对";
@@ -143,6 +144,7 @@
 "A new folder with the transfer name is created inside every destination." = "系统会在每个目的地内创建以此传输命名的新文件夹。";
 "Files are written straight into every destination, beside what is already there. Existing files are never overwritten — a name collision fails that file instead." = "文件将直接写入每个目的地，与其中已有内容并列。已有文件绝不会被覆盖——出现同名时该文件会判为失败。";
 "Nothing was selected from the source." = "未从来源中选择任何内容。";
+"The source could not be read completely: %@" = "无法完整读取来源：%@";
 "A cascade copies from one verified destination; its source is fixed." = "级联传输从某个已验证目的地复制，其来源是固定的。";
 "A cascade's source is the verified destination it came from." = "级联传输的来源就是它所依据的那个已验证目的地。";
 "Remove this source from the plan" = "从计划中移除此来源";
@@ -158,6 +160,12 @@
 "Preflight has warnings" = "预检有警告";
 "Preflight needs attention" = "预检需要处理";
 "I understand these copies are not on independent volumes." = "我明白这些副本并不位于彼此独立的宗卷上。";
+"A camera-card source cannot also be its own destination volume." = "摄影机卡来源不能同时作为自身的目的地宗卷。";
+"A camera-card source cannot share its physical device with a destination." = "摄影机卡来源不能与目的地位于同一物理设备上。";
+"%@ is on the same volume as the source; this is not an independent backup." = "%@ 与来源位于同一宗卷上；这不是独立备份。";
+"%@ is on the same physical device as the source; this is not an independent backup." = "%@ 与来源位于同一物理设备上；这不是独立备份。";
+"%@ share one physical volume; they are not independent copies." = "%@ 共用同一物理宗卷；它们不是彼此独立的副本。";
+"Could not identify the physical device behind %@; the copies cannot be confirmed as independent." = "无法识别 %@ 所在的物理设备；无法确认这些副本彼此独立。";
 "Source contents" = "来源内容";
 "Media analysis" = "媒体分析";
 "Previously seen" = "曾经见过";
@@ -250,6 +258,12 @@
 /* Manifests and verification */
 "Read-only verification from a Doppelganger JSON manifest or ASC MHL." = "通过 Doppelganger JSON 清单或 ASC MHL 进行只读验证。";
 "Verification reports missing, added, size-mismatched, unreadable, and digest-mismatched files. It never writes inside the selected media folder." = "验证会报告缺失、新增、大小不符、无法读取或摘要不符的文件，绝不会写入所选媒体文件夹。";
+"The media folder could not be read completely: %@" = "无法完整读取媒体文件夹：%@";
+"1 file has no checksum in this reference, so it cannot be verified. Choose the manifest of a verified attempt." = "此基准中有 1 个文件没有校验和，因此无法验证。请选择已验证尝试的清单。";
+"%lld files have no checksum in this reference, so they cannot be verified. Choose the manifest of a verified attempt." = "此基准中有 %lld 个文件没有校验和，因此无法验证。请选择已验证尝试的清单。";
+"The MHL lists files without a size or a supported checksum (XXH3-64, XXH64BE, MD5), so it cannot prove this folder is complete." = "该 MHL 列出的部分文件缺少大小或受支持的校验和（XXH3-64、XXH64BE、MD5），因此无法证明此文件夹完整。";
+"This MHL marks the hash of %@ as “%@”, so it cannot be used as a reference. Choose the MHL generation that recorded the original hashes." = "此 MHL 将 %1$@ 的哈希标记为“%2$@”，因此不能用作验证基准。请选择记录了原始哈希的 MHL 世代。";
+"This MHL marks the hash of %@ as “%@” (%lld files in total), so it cannot be used as a reference. Choose the MHL generation that recorded the original hashes." = "此 MHL 将 %1$@ 的哈希标记为“%2$@”（共 %3$lld 个文件），因此不能用作验证基准。请选择记录了原始哈希的 MHL 世代。";
 
 /* Help topics */
 "Getting Started" = "开始使用";
@@ -311,6 +325,8 @@
 "Paused · completed files retained" = "已暂停 · 已完成文件已保留";
 "Verified · %@" = "已验证 · %@";
 "Failed · %@" = "失败 · %@";
+"Copies verified · transfer not verified" = "副本已验证 · 传输未验证";
+"Transferred · transfer not verified" = "已传输 · 传输未验证";
 "Choose a source to offload." = "请选择要传输的来源。";
 "Source %@ is not mounted." = "来源 %@ 未挂载。";
 "The same source is listed twice." = "同一来源被重复添加。";
@@ -407,3 +423,50 @@
 "verification pending" = "等待验证";
 "failed" = "失败";
 "skipped" = "已跳过";
+
+/* Transfer card headline and phase text (TransferSession.headline) */
+"Queued · waiting for a slot" = "排队中 · 等待空闲槽位";
+"Paused safely · Resume available" = "已安全暂停 · 可以继续";
+"Paused · continued in a linked attempt" = "已暂停 · 已由关联尝试接续";
+"Verified · Complete" = "已验证 · 完成";
+"Interrupted · Review required" = "已中断 · 需要检查";
+"Failed · 1 copy result failed" = "失败 · 1 个复制结果失败";
+"Failed · %lld copy results failed" = "失败 · %lld 个复制结果失败";
+"Failed · transfer evidence incomplete" = "失败 · 传输证据不完整";
+"Cancelled · Incomplete" = "已取消 · 不完整";
+"Scanning source…" = "正在扫描来源…";
+"Maximum · reading source…" = "最高模式 · 正在读取来源…";
+"Copying · %lld%%" = "正在复制 · %lld%%";
+"Verifying · %lld%%" = "正在验证 · %lld%%";
+"Writing manifest…" = "正在写入清单…";
+"Finishing…" = "正在完成…";
+
+/* Transfer card captions and detail */
+"Started by %@" = "由 %@ 启动";
+"FILES" = "文件";
+"ID" = "编号";
+"bottleneck" = "瓶颈";
+"Transfer rate" = "传输速率";
+"ETA" = "预计剩余时间";
+"Pausing after the current file finishes · %@" = "当前文件完成后暂停 · %@";
+"Pausing after the current file finishes" = "当前文件完成后暂停";
+"%lld files × 1 destination — every copy passed checksum verification." = "%lld 个文件 × 1 个目的地——每个副本均通过校验和验证。";
+"1 failure" = "1 个失败";
+"%lld failures" = "%lld 个失败";
+"Transfer-level issue" = "传输级问题";
+"Transfer-level warning" = "传输级警告";
+
+/* Transfers dashboard */
+"1 transfer" = "1 个传输";
+"%lld transfers" = "%lld 个传输";
+"Dismiss" = "忽略";
+"Dismiss mount notice" = "忽略挂载提示";
+"No current issues" = "当前没有问题";
+"Attention needed" = "需要处理";
+"No current transfer has reported a problem" = "当前没有传输报告问题";
+"A transfer failed, was cancelled, or still needs verification" = "有传输失败、已取消或仍需验证";
+
+/* Preflight verdict */
+"%lld files · %@" = "%1$lld 个文件 · %2$@";
+"%lld recognized media · %lld sidecars" = "%1$lld 个已识别媒体 · %2$lld 个 sidecar";
+"This exact source plan was verified before · %@ → %@" = "此来源计划之前已验证通过 · %1$@ → %2$@";
