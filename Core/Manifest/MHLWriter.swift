@@ -347,15 +347,9 @@ private struct HistoryBaseline {
 }
 
 private extension MHLDocument.Entry {
-    private var normalizedAction: String? {
-        action?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    var recordsOriginalHash: Bool { normalizedAction == "original" }
+    var recordsOriginalHash: Bool { hashActions.contains("original") }
     /// An unannotated record (older writers) is trusted.
-    var recordsUntrustedHash: Bool {
-        normalizedAction.map { !["original", "verified", "new"].contains($0) } ?? false
-    }
+    var recordsUntrustedHash: Bool { untrustedHashAction != nil }
 }
 
 enum DirectoryHashes {
