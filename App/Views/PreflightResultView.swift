@@ -15,6 +15,14 @@ struct PreflightResultView: View {
     @State private var showingHistory = false
     @State private var tree: [SourceTreeNode] = []
 
+    /// Consent to copies on one device keeps its own wording; any other
+    /// warning in the mix makes the acknowledgement about all of them.
+    private var acknowledgementLabel: LocalizedStringKey {
+        Set(result.warnings).isSubset(of: result.sameDeviceWarnings)
+            ? "I understand these copies are not on independent volumes."
+            : "I have read these warnings and want to continue."
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             headline
@@ -40,7 +48,7 @@ struct PreflightResultView: View {
                     .foregroundStyle(.blue)
             }
             if result.requiresAcknowledgement {
-                Toggle("I understand these copies are not on independent volumes.", isOn: $warningsAcknowledged)
+                Toggle(acknowledgementLabel, isOn: $warningsAcknowledged)
                     .font(.callout.weight(.medium))
             }
             Divider()

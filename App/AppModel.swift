@@ -1082,7 +1082,9 @@ final class AppModel {
                 operatorProfile: attributedProfile,
                 projectID: selectedProjectID,
                 sourceFingerprint: preflight.sourceFingerprint,
-                allowSameVolume: warningsAcknowledged,
+                // Only an acknowledged independence warning permits copies on
+                // one device; acknowledging any other warning never does.
+                allowSameVolume: preflight.allowsSameDevice(acknowledged: warningsAcknowledged),
                 // Exactly the reviewed items, so a selection transfers what was
                 // asked for and nothing else under the same source.
                 includedRelativePaths: preflight.includedRelativePaths,
