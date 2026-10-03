@@ -568,14 +568,7 @@ final class ProductDatabase: @unchecked Sendable {
         case .failed: .failed
         case .cancelled: .cancelled
         }
-        let lifecycle: TaskLifecycle = switch verdict {
-        case .paused: .paused
-        case .transferredPendingVerification: .transferredPendingVerification
-        case .verified: .complete
-        case .failed, .needsAttention: .failed
-        case .cancelled: .cancelled
-        case .pending: .complete
-        }
+        let lifecycle = Self.lifecycle(for: verdict)
         let encoder = JSONEncoder()
         let issues = try String(decoding: encoder.encode(report.issues), as: UTF8.self)
         let manifest = TransferManifest(report: report)
@@ -617,12 +610,11 @@ final class ProductDatabase: @unchecked Sendable {
                     lifecycle.rawValue, verdict.rawValue, report.finishedAt.timeIntervalSince1970,
                     issues, id.uuidString.lowercased()
                 ])
-            try db.execute(sql: """
-                UPDATE transfer_tasks SET lifecycle = ?, verdict = ?, updated_at = ? WHERE id = ?
-                """, arguments: [
-                    lifecycle.rawValue, verdict.rawValue, report.finishedAt.timeIntervalSince1970,
-                    taskID.uuidString.lowercased()
-                ])
+            // A finished attempt's file records are exactly its own report.
+            try db.execute(
+                sql: "DELETE FROM file_records WHERE attempt_id = ?",
+                arguments: [id.uuidString.lowercased()]
+            )
             for row in fileRows {
                 try db.execute(sql: """
                     INSERT OR REPLACE INTO file_records
@@ -642,6 +634,13 @@ final class ProductDatabase: @unchecked Sendable {
                         artifact.1, artifact.2, artifact.3, artifact.4, artifact.5
                     ])
             }
+            // The task verdict is derived from every finished attempt, never
+            // copied from this one: a fine-grained retry covers one
+            // destination's subset of the plan, so the attempt that happens to
+            // finish last cannot speak for the whole task. It runs after this
+            // attempt's evidence rows exist, because they decide which
+            // destinations the attempt can vouch for.
+            try Self.refreshTaskAggregate(taskID: taskID, updatedAt: report.finishedAt, db: db)
             try Self.insertAudit(
                 AuditEventRecord(
                     taskID: taskID,
@@ -656,6 +655,17 @@ final class ProductDatabase: @unchecked Sendable {
                 ),
                 db: db
             )
+        }
+    }
+
+    private static func lifecycle(for verdict: TransferVerdict) -> TaskLifecycle {
+        switch verdict {
+        case .paused: .paused
+        case .transferredPendingVerification: .transferredPendingVerification
+        case .verified: .complete
+        case .failed, .needsAttention: .failed
+        case .cancelled: .cancelled
+        case .pending: .complete
         }
     }
 
@@ -1098,6 +1108,121 @@ final class ProductDatabase: @unchecked Sendable {
         )
     }
 
+    /// The engine's transfer issue for evidence it could not write to some
+    /// roots (`TransferWorker.finish`). Only this issue is scoped per
+    /// destination. Advisory warnings (`TransferWorker.warningIssuePrefix`)
+    /// are neutral; every other issue makes the attempt vouch for nothing.
+    static let evidenceWriteIssuePrefix = "Could not write complete transfer evidence to: "
+
+    /// Destinations an attempt recorded results for.
+    private static func recordedDestinations(_ attemptKey: String, db: Database) throws -> [String] {
+        let rows = try String.fetchAll(
+            db,
+            sql: "SELECT outcomes_json FROM file_records WHERE attempt_id = ?",
+            arguments: [attemptKey]
+        )
+        var destinations = Set<String>()
+        let decoder = JSONDecoder()
+        for json in rows {
+            for pair in (try? decoder.decode([RecordedPairResult].self, from: Data(json.utf8))) ?? [] {
+                destinations.insert(pair.destination)
+            }
+        }
+        return Array(destinations)
+    }
+
+    /// The fields of a recorded per-destination result the rollup needs.
+    private struct RecordedPairResult: Decodable {
+        let destination: String
+        let status: String
+    }
+
+    /// Re-derives the task's verdict and lifecycle from all of its finished
+    /// attempts (`TaskVerdictRollup`). A task with no finished attempt keeps
+    /// its row as registered. Unreadable catalog data is never read as success.
+    private static func refreshTaskAggregate(taskID: UUID, updatedAt: Date, db: Database) throws {
+        let taskKey = taskID.uuidString.lowercased()
+        guard let destinationsJSON = try String.fetchOne(
+            db,
+            sql: "SELECT destination_paths_json FROM transfer_tasks WHERE id = ?",
+            arguments: [taskKey]
+        ) else { return }
+        let decoder = JSONDecoder()
+        let destinations = (try? decoder.decode([String].self, from: Data(destinationsJSON.utf8))) ?? []
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT id, kind, verdict, issues_json FROM transfer_attempts
+            WHERE task_id = ? AND finished_at IS NOT NULL
+            ORDER BY finished_at, COALESCE(started_at, 0), rowid
+            """, arguments: [taskKey])
+        var attempts: [TaskVerdictRollup.Attempt] = []
+        for row in rows {
+            let attemptKey: String = row["id"]
+            let issuesJSON: String = row["issues_json"]
+            // Advisory warnings never fail a run, so they never narrow what
+            // it vouches for: the attempt is judged as if they were absent.
+            let issues = (try? decoder.decode([String].self, from: Data(issuesJSON.utf8)))?
+                .filter { !$0.hasPrefix(TransferWorker.warningIssuePrefix) }
+            let vouching: TaskVerdictRollup.Vouching
+            if let issues, issues.isEmpty {
+                vouching = .everywhere
+            } else if let issues, issues.allSatisfy({ $0.hasPrefix(Self.evidenceWriteIssuePrefix) }) {
+                // Evidence that could not be written to some roots: the
+                // attempt still vouches where its manifest did land.
+                let manifests = try String.fetchAll(
+                    db,
+                    sql: "SELECT path FROM evidence_artifacts WHERE attempt_id = ? AND kind = 'json-manifest'",
+                    arguments: [attemptKey]
+                )
+                let candidates = destinations + (try Self.recordedDestinations(attemptKey, db: db))
+                vouching = .only(Set(candidates.filter { destination in
+                    manifests.contains { $0.hasPrefix(destination + "/") }
+                }))
+            } else {
+                // Any other transfer-level issue (veto, source changed, MHL
+                // failure), or issues that cannot be read: vouch for nothing.
+                vouching = .nowhere
+            }
+            var results: [String: [String: TaskVerdictRollup.PairState]]? = [:]
+            let records = try Row.fetchAll(
+                db,
+                sql: "SELECT relative_path, outcomes_json FROM file_records WHERE attempt_id = ?",
+                arguments: [attemptKey]
+            )
+            for record in records {
+                let path: String = record["relative_path"]
+                let outcomesJSON: String = record["outcomes_json"]
+                guard let pairs = try? decoder.decode(
+                    [RecordedPairResult].self, from: Data(outcomesJSON.utf8)
+                ) else {
+                    results = nil // fail closed
+                    break
+                }
+                var byDestination: [String: TaskVerdictRollup.PairState] = [:]
+                for pair in pairs {
+                    let state = TaskVerdictRollup.PairState(manifestStatus: pair.status)
+                    // A destination listed twice is ambiguous; never success.
+                    byDestination[pair.destination] = byDestination[pair.destination] == nil ? state : .unverified
+                }
+                results?[path] = byDestination
+            }
+            attempts.append(TaskVerdictRollup.Attempt(
+                kind: TransferAttemptKind(rawValue: row["kind"]) ?? .copy,
+                verdict: TransferVerdict(rawValue: row["verdict"]) ?? .failed,
+                vouching: vouching,
+                results: results
+            ))
+        }
+        guard let verdict = TaskVerdictRollup.verdict(destinations: destinations, attempts: attempts)
+        else { return }
+        try db.execute(
+            sql: "UPDATE transfer_tasks SET lifecycle = ?, verdict = ?, updated_at = ? WHERE id = ?",
+            arguments: [
+                Self.lifecycle(for: verdict).rawValue, verdict.rawValue,
+                updatedAt.timeIntervalSince1970, taskKey,
+            ]
+        )
+    }
+
     private static func insertAudit(_ event: AuditEventRecord, db: Database) throws {
         try db.execute(sql: """
             INSERT INTO audit_events
@@ -1163,5 +1288,173 @@ final class ProductDatabase: @unchecked Sendable {
             occurredAt: Date(timeIntervalSince1970: row["occurred_at"]),
             detail: row["detail"]
         )
+    }
+}
+
+/// Derives a task's catalog verdict from every attempt that has finished.
+///
+/// A task aggregates immutable attempts (offload-model.md), so its verdict is
+/// a projection, never a copy of whichever attempt finished last. A
+/// fine-grained retry covers one destination's subset of the plan; the task
+/// reads Verified only when every item of the plan has a verified result at
+/// every destination, taken from the latest attempt that addressed that pair.
+/// Partial failure is failure, and nothing unreadable is read as success.
+enum TaskVerdictRollup {
+    /// One item × destination result as an attempt recorded it.
+    enum PairState: Sendable, Equatable {
+        case verified
+        case pendingVerification
+        /// Failed, skipped, or a status this projection does not recognise.
+        case unverified
+
+        /// Maps `TransferManifest.ItemRecord.Result.status`.
+        init(manifestStatus: String) {
+            switch manifestStatus {
+            case "verified": self = .verified
+            case "transferred-pending-verification": self = .pendingVerification
+            default: self = .unverified
+            }
+        }
+    }
+
+    /// Where an attempt's own results count as evidence.
+    enum Vouching: Sendable, Equatable {
+        /// No transfer-level issue other than advisory warnings.
+        case everywhere
+        /// Evidence could not be written everywhere; its results count only
+        /// at destinations where its manifest landed.
+        case only(Set<String>)
+        /// A transfer-level failure (veto, source changed, MHL, unreadable
+        /// issues): none of its verified results count.
+        case nowhere
+
+        func covers(_ destination: String) -> Bool {
+            switch self {
+            case .everywhere: true
+            case .only(let destinations): destinations.contains(destination)
+            case .nowhere: false
+            }
+        }
+    }
+
+    struct Attempt: Sendable {
+        var kind: TransferAttemptKind
+        var verdict: TransferVerdict
+        var vouching: Vouching
+        /// Relative path → destination path → state; `nil` when the attempt's
+        /// file records could not be read.
+        var results: [String: [String: PairState]]?
+    }
+
+    /// - Parameters:
+    ///   - destinations: the task's planned destination paths.
+    ///   - attempts: finished attempts, oldest result first.
+    /// - Returns: the task verdict, or `nil` when no attempt bears on it.
+    static func verdict(destinations: [String], attempts: [Attempt]) -> TransferVerdict? {
+        var standing: [Pair: PairState] = [:]
+        var items = Set<String>()
+        var planDestinations = Set(destinations)
+        var unreadable = false
+        var base: TransferVerdict?
+
+        for attempt in attempts {
+            switch attempt.kind {
+            case .contactSheet:
+                // Optional artifacts never move the media verdict.
+                continue
+            case .verification where base != nil:
+                // A verification linked to an existing task may lift copies
+                // still awaiting read-back to verified. It never edits a
+                // failure into success, and a failed check stays on its own
+                // attempt row.
+                guard attempt.verdict == .verified, attempt.vouching == .everywhere,
+                      let results = attempt.results else { continue }
+                for (path, byDestination) in results {
+                    for (destination, state) in byDestination where state == .verified {
+                        let pair = Pair(path: path, destination: destination)
+                        if standing[pair] == .pendingVerification { standing[pair] = .verified }
+                    }
+                }
+                if base == .transferredPendingVerification { base = .verified }
+            case .retry where base != nil:
+                // A repair is repair-only. Since a retry can never move a
+                // copy it cannot prove is the parent's failed bytes, its own
+                // failure says nothing about pairs that already stand
+                // verified: its proven results raise pairs, and anything else
+                // leaves the standing state alone.
+                if attempt.verdict == .verified || attempt.verdict == .transferredPendingVerification {
+                    base = attempt.verdict
+                }
+                guard let results = attempt.results else {
+                    unreadable = true
+                    continue
+                }
+                let vouches = attempt.verdict == .verified
+                    || attempt.verdict == .transferredPendingVerification
+                    || attempt.vouching != .nowhere
+                for (path, byDestination) in results {
+                    items.insert(path)
+                    for (destination, state) in byDestination {
+                        planDestinations.insert(destination)
+                        let pair = Pair(path: path, destination: destination)
+                        let counts = vouches && attempt.vouching.covers(destination)
+                        switch (counts ? state : .unverified, standing[pair]) {
+                        case (.verified, _):
+                            standing[pair] = .verified
+                        case (.pendingVerification, .verified?):
+                            break
+                        case (.pendingVerification, _):
+                            standing[pair] = .pendingVerification
+                        case (.unverified, nil):
+                            standing[pair] = .unverified
+                        case (.unverified, _?):
+                            break
+                        }
+                    }
+                }
+            default:
+                base = attempt.verdict
+                guard let results = attempt.results else {
+                    unreadable = true
+                    continue
+                }
+                // A run that ended unsuccessfully for a transfer-level reason
+                // (source changed, veto, MHL) does not vouch for the copies it
+                // lists as verified; one whose evidence missed some roots
+                // still vouches where its manifest landed.
+                let vouches = attempt.verdict == .verified
+                    || attempt.verdict == .transferredPendingVerification
+                for (path, byDestination) in results {
+                    items.insert(path)
+                    for (destination, state) in byDestination {
+                        planDestinations.insert(destination)
+                        let counts = vouches || attempt.vouching.covers(destination)
+                        standing[Pair(path: path, destination: destination)] = counts ? state : .unverified
+                    }
+                }
+            }
+        }
+
+        guard let base else { return nil }
+        // Only success is capped by the pairs; any other latest outcome
+        // already says the task is not verified.
+        guard base == .verified || base == .transferredPendingVerification else { return base }
+        guard !unreadable, !items.isEmpty, !planDestinations.isEmpty else { return .failed }
+        var pending = base == .transferredPendingVerification
+        for path in items {
+            for destination in planDestinations {
+                switch standing[Pair(path: path, destination: destination)] {
+                case .verified?: break
+                case .pendingVerification?: pending = true
+                case .unverified?, nil: return .failed
+                }
+            }
+        }
+        return pending ? .transferredPendingVerification : .verified
+    }
+
+    private struct Pair: Hashable {
+        let path: String
+        let destination: String
     }
 }

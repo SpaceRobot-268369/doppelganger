@@ -184,6 +184,9 @@ struct TransferPreflight: Sendable, Equatable {
                     )
                 }
                 if items.isEmpty, blocking.isEmpty { blocking.append("The source is empty.") }
+            } catch FileSystemError.notReadable(let detail) {
+                // A partial scan must never become a smaller, clean-looking plan.
+                blocking.append(L10n.format("The source could not be read completely: %@", detail))
             } catch {
                 blocking.append("The source could not be scanned: \(error)")
             }

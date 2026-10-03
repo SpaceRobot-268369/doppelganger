@@ -143,6 +143,7 @@
 "A new folder with the transfer name is created inside every destination." = "系统会在每个目的地内创建以此传输命名的新文件夹。";
 "Files are written straight into every destination, beside what is already there. Existing files are never overwritten — a name collision fails that file instead." = "文件将直接写入每个目的地，与其中已有内容并列。已有文件绝不会被覆盖——出现同名时该文件会判为失败。";
 "Nothing was selected from the source." = "未从来源中选择任何内容。";
+"The source could not be read completely: %@" = "无法完整读取来源：%@";
 "A cascade copies from one verified destination; its source is fixed." = "级联传输从某个已验证目的地复制，其来源是固定的。";
 "A cascade's source is the verified destination it came from." = "级联传输的来源就是它所依据的那个已验证目的地。";
 "Remove this source from the plan" = "从计划中移除此来源";
@@ -249,6 +250,12 @@
 /* Manifests and verification */
 "Read-only verification from a Doppelganger JSON manifest or ASC MHL." = "通过 Doppelganger JSON 清单或 ASC MHL 进行只读验证。";
 "Verification reports missing, added, size-mismatched, unreadable, and digest-mismatched files. It never writes inside the selected media folder." = "验证会报告缺失、新增、大小不符、无法读取或摘要不符的文件，绝不会写入所选媒体文件夹。";
+"The media folder could not be read completely: %@" = "无法完整读取媒体文件夹：%@";
+"1 file has no checksum in this reference, so it cannot be verified. Choose the manifest of a verified attempt." = "此基准中有 1 个文件没有校验和，因此无法验证。请选择已验证尝试的清单。";
+"%lld files have no checksum in this reference, so they cannot be verified. Choose the manifest of a verified attempt." = "此基准中有 %lld 个文件没有校验和，因此无法验证。请选择已验证尝试的清单。";
+"The MHL lists files without a size or a supported checksum (XXH3-64, XXH64BE, MD5), so it cannot prove this folder is complete." = "该 MHL 列出的部分文件缺少大小或受支持的校验和（XXH3-64、XXH64BE、MD5），因此无法证明此文件夹完整。";
+"This MHL marks the hash of %@ as “%@”, so it cannot be used as a reference. Choose the MHL generation that recorded the original hashes." = "此 MHL 将 %1$@ 的哈希标记为“%2$@”，因此不能用作验证基准。请选择记录了原始哈希的 MHL 世代。";
+"This MHL marks the hash of %@ as “%@” (%lld files in total), so it cannot be used as a reference. Choose the MHL generation that recorded the original hashes." = "此 MHL 将 %1$@ 的哈希标记为“%2$@”（共 %3$lld 个文件），因此不能用作验证基准。请选择记录了原始哈希的 MHL 世代。";
 
 /* Help topics */
 "Getting Started" = "开始使用";

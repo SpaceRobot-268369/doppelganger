@@ -10,6 +10,9 @@ public struct RealFileSystem: FileSystemAccess {
     /// Regular files under `root`, relative paths preserved, sorted for
     /// determinism. Only known operating-system metadata is excluded; arbitrary
     /// hidden files are media unless the user explicitly configures otherwise.
+    /// Preflight, the engine plan and the post-transfer rescan all treat this
+    /// list as the complete source, so a scan that could not see the whole
+    /// tree throws instead of returning a shorter list.
     public func enumerate(root: URL) throws -> [SourceItem] {
         let resolvedRoot = canonicalURL(root)
         let rootPath = resolvedRoot.path
@@ -20,10 +23,20 @@ public struct RealFileSystem: FileSystemAccess {
             throw FileSystemError.volumeGone
         }
 
+        // A folder FileManager cannot list (EACCES, EPERM, EIO) is reported
+        // only here; without a handler its whole subtree vanishes silently.
+        // The handler runs synchronously inside nextObject().
+        var unreadable: [String] = []
         guard let enumerator = manager.enumerator(
             at: resolvedRoot,
             includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
-            options: []
+            options: [],
+            errorHandler: { url, error in
+                if !Self.toleratesReadError(at: url.path, rootPath: rootPath) {
+                    unreadable.append(Self.unreadableEntry(path: url.path, error: error))
+                }
+                return true // keep scanning so every unreadable folder is named
+            }
         ) else {
             throw FileSystemError.notReadable(detail: "\(rootPath): could not enumerate")
         }
@@ -37,20 +50,83 @@ public struct RealFileSystem: FileSystemAccess {
                 }
                 continue
             }
-            let values = try? url.resourceValues(
-                forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
-            )
-            guard values?.isRegularFile == true else { continue }
+            let values: URLResourceValues
+            do {
+                values = try url.resourceValues(
+                    forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+                )
+            } catch {
+                if !Self.toleratesReadError(at: url.path, rootPath: rootPath) {
+                    unreadable.append(Self.unreadableEntry(path: url.path, error: error))
+                }
+                continue
+            }
+            guard values.isRegularFile == true else { continue }
             let resolved = url.resolvingSymlinksInPath().path
             guard resolved.hasPrefix(rootPath + "/") else { continue }
             let relativePath = String(resolved.dropFirst(rootPath.count + 1))
             items.append(SourceItem(
                 relativePath: relativePath,
-                size: Int64(values?.fileSize ?? 0),
-                modificationTime: values?.contentModificationDate?.timeIntervalSince1970
+                size: Int64(values.fileSize ?? 0),
+                modificationTime: values.contentModificationDate?.timeIntervalSince1970
             ))
         }
+        if !unreadable.isEmpty {
+            // A card pulled mid-scan is a vanished volume, not a permissions problem.
+            guard manager.fileExists(atPath: rootPath) else { throw FileSystemError.volumeGone }
+            throw FileSystemError.notReadable(detail: Self.unreadableDetail(unreadable))
+        }
         return items.sorted { $0.relativePath < $1.relativePath }
+    }
+
+    /// macOS-private stores that exist only at a volume root and are kept
+    /// unreadable to ordinary users. They never hold camera media, so a read
+    /// error at or under one of them, directly beneath the scanned root, is
+    /// handled exactly as before this check existed. The same name anywhere
+    /// deeper is ordinary content and fails the scan.
+    private static let rootLevelSystemStores: Set<String> = [
+        ".DocumentRevisions-V100",
+        ".HFS+ Private Directory Data\r",
+        ".PKInstallSandboxManager",
+        ".PKInstallSandboxManager-SystemSoftware",
+    ]
+
+    /// Read errors that leave no gap in the plan: at or under known metadata
+    /// (excluded from every plan anyway) or under a root-level system store.
+    /// The root itself, and anything outside it, never qualifies.
+    private static func toleratesReadError(at path: String, rootPath: String) -> Bool {
+        // FileManager can report an error URL through the `/private` firmlink
+        // (`/private/var/…`) while the canonical root reads `/var/…`, or the
+        // other way round; compare both spellings.
+        let alternate = path.hasPrefix("/private/")
+            ? String(path.dropFirst("/private".count))
+            : "/private" + path
+        guard let match = [path, alternate].first(where: { $0.hasPrefix(rootPath + "/") }) else {
+            return false
+        }
+        let relativePath = String(match.dropFirst(rootPath.count + 1))
+        let topLevel = String(relativePath.prefix { $0 != "/" })
+        return isKnownMetadata(relativePath) || rootLevelSystemStores.contains(topLevel)
+    }
+
+    private static func unreadableEntry(path: String, error: any Error) -> String {
+        let nsError = error as NSError
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError,
+           underlying.domain == NSPOSIXErrorDomain {
+            return "\(path): \(String(cString: strerror(Int32(truncatingIfNeeded: underlying.code))))"
+        }
+        if nsError.domain == NSPOSIXErrorDomain {
+            return "\(path): \(String(cString: strerror(Int32(truncatingIfNeeded: nsError.code))))"
+        }
+        return "\(path): \(nsError.localizedDescription)"
+    }
+
+    /// At most five paths, deduplicated, so a dying card stays legible.
+    private static func unreadableDetail(_ entries: [String]) -> String {
+        var seen = Set<String>()
+        let unique = entries.filter { seen.insert($0).inserted }
+        let shown = unique.prefix(5).joined(separator: "; ")
+        return unique.count > 5 ? "\(shown); and \(unique.count - 5) more" : shown
     }
 
     public func canonicalURL(_ url: URL) -> URL {
