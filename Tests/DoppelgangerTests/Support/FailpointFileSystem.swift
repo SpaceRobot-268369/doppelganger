@@ -8,6 +8,7 @@ import Foundation
 final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
     private let base: any FileSystemAccess
     private let lock = NSLock()
+    private var volumeOverrides: [String: FileSystemVolume] = [:]  // canonical root path → reported volume
 
     // Failpoint state, lock-guarded.
     private var corruptOnWriteSuffixes: Set<String> = []
@@ -16,6 +17,16 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
     private var goneAfterReadBudgets: [String: Int] = [:]  // root path → readable bytes before the volume "vanishes"
     private var goneAfterWriteBudgets: [String: Int] = [:] // root path → writable bytes before the volume "vanishes"
     private var unreadableSuffixes: Set<String> = []
+    private struct InjectedReadError {
+        let afterBytes: Int
+        var failingOpens: Int
+    }
+    private struct ArmedReadError {
+        let limit: Int
+        var bytesRead: Int
+    }
+    private var readErrorSpecs: [String: InjectedReadError] = [:] // path suffix → mid-file read error to inject
+    private var armedReadErrors: [String: ArmedReadError] = [:]   // open path → bytes allowed before it fires
     private var changedSourceSuffixes: Set<String> = []
     private var freeSpaceOverrides: [String: Int64] = [:]
     private var evidenceWriteFailureRoots: Set<String> = []
@@ -62,12 +73,30 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
         _ = withLock { unreadableSuffixes.insert(pathSuffix) }
     }
 
+    /// Reads of any path with this suffix throw `.notReadable` (what a real
+    /// EIO on read maps to in `IOContext.reading`) once `afterBytes` bytes have
+    /// come through that open stream: a bad sector past the first byte, which
+    /// preflight's first-byte probe cannot see. Only the next `failingOpens`
+    /// opens are armed; later opens read cleanly, like a marginal sector that
+    /// succeeds on a re-read.
+    func injectReadError(pathSuffix: String, afterBytes: Int, failingOpens: Int = .max) {
+        withLock { readErrorSpecs[pathSuffix] = InjectedReadError(afterBytes: afterBytes, failingOpens: failingOpens) }
+    }
+
     func markSourceChanged(pathSuffix: String) {
         _ = withLock { changedSourceSuffixes.insert(pathSuffix) }
     }
 
     func overrideFreeSpace(at root: URL, bytes: Int64) {
         withLock { freeSpaceOverrides[root.path] = bytes }
+    }
+
+    /// Report `volume` for everything at or under `root`. Stands in for disk
+    /// layouts no test machine has: two APFS volumes or partitions on one
+    /// disk, two shares on one server, a device the platform cannot name.
+    func overrideVolume(at root: URL, with volume: FileSystemVolume) {
+        let key = base.canonicalURL(root).path
+        withLock { volumeOverrides[key] = volume }
     }
 
     func failEvidenceWrites(under root: URL) {
@@ -106,7 +135,13 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
 
     func canonicalURL(_ url: URL) -> URL { base.canonicalURL(url) }
 
-    func volume(at url: URL) throws -> FileSystemVolume { try base.volume(at: url) }
+    func volume(at url: URL) throws -> FileSystemVolume {
+        let path = base.canonicalURL(url).path
+        let override = withLock {
+            volumeOverrides.filter { covered(path, by: $0.key) }.max { $0.key.count < $1.key.count }?.value
+        }
+        return try override ?? base.volume(at: url)
+    }
 
     func sourceItem(at url: URL, relativeTo root: URL) throws -> SourceItem {
         if isGone(url.path) { throw FileSystemError.volumeGone }
@@ -136,6 +171,14 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
         if isGone(path) { throw FileSystemError.volumeGone }
         if withLock({ unreadableSuffixes.contains { path.hasSuffix($0) } }) {
             throw FileSystemError.notReadable(detail: "\(path): injected unreadable file")
+        }
+        withLock {
+            armedReadErrors[path] = nil
+            if let suffix = readErrorSpecs.keys.first(where: { path.hasSuffix($0) }),
+               let spec = readErrorSpecs[suffix], spec.failingOpens > 0 {
+                readErrorSpecs[suffix]?.failingOpens -= 1
+                armedReadErrors[path] = ArmedReadError(limit: spec.afterBytes, bytesRead: 0)
+            }
         }
         return FailpointReadStream(base: try base.openForReading(url, uncached: uncached), path: path, owner: self)
     }
@@ -203,10 +246,16 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
         let delay = withLock { readDelayMicros }
         if delay > 0 { usleep(delay) }
         if isGone(path) { throw FileSystemError.volumeGone }
+        if let armed = withLock({ armedReadErrors[path] }), armed.bytesRead >= armed.limit {
+            throw FileSystemError.notReadable(
+                detail: "\(path): injected read error (EIO) after \(armed.limit) bytes"
+            )
+        }
     }
 
     fileprivate func afterRead(path: String, count: Int) {
         withLock {
+            armedReadErrors[path]?.bytesRead += count
             for (root, budget) in goneAfterReadBudgets where covered(path, by: root) {
                 let remaining = budget - count
                 goneAfterReadBudgets[root] = remaining
