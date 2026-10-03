@@ -134,6 +134,7 @@ struct DirectBatchCollisionTests {
             },
             blockingIssues: [],
             warnings: [],
+            sameDeviceWarnings: [],
             notices: []
         )
     }

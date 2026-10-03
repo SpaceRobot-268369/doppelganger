@@ -22,6 +22,7 @@ struct LocalizationTests {
         "%@ free",
         "%@ is on the same physical device as the source; this is not an independent backup.",
         "%@ is on the same volume as the source; this is not an independent backup.",
+        "%@ no longer matches the checksum its chain recorded",
         "%@ paused",
         "%@ share one physical volume; they are not independent copies.",
         "%@ transferred",
@@ -114,6 +115,11 @@ struct LocalizationTests {
         "Started by %@",
         "Stopped at a complete-file boundary. Keep the source connected to resume.",
         "Stopped before completion — these copies are not complete. Do not erase the source media.",
+        "The ASC MHL history in %@ already records %lld planned path(s) only under another checksum type, %@: %@. It mixes checksum types, so no single type matches every planned path. This offload could not add its MHL record; choose a new folder.",
+        "The ASC MHL history in %@ already records %lld planned path(s) only under another checksum type, %@: %@. This offload could not add its MHL record; use the checksum type the folder already uses, or choose a new folder.",
+        "The ASC MHL history in %@ already records a different file at %lld planned path(s): %@. This offload could not add its MHL record; choose a new folder.",
+        "The ASC MHL history in %@ cannot be read: %@. This offload could not add its MHL record there; choose another folder.",
+        "The ASC MHL history in %@ records %lld planned path(s) at the same size but a different modification time: %@. If the contents differ, this offload will fail when it writes its MHL record.",
         "The failed attempt's manifest is unavailable; use Retry as New Offload instead.",
         "The folder name for %@ changed after preflight. Run preflight again.",
         "The media folder could not be read completely: %@",
@@ -146,6 +152,7 @@ struct LocalizationTests {
         "[folder per source]",
         "bottleneck",
         "in %@",
+        "its chain or a generation is missing, unreadable, or malformed",
         "…and %lld more",
     ]
 

@@ -42,10 +42,21 @@ struct TransferPreflight: Sendable, Equatable {
     let destinations: [Destination]
     let blockingIssues: [String]
     let warnings: [String]
+    /// The `warnings` about independence. Acknowledging one of these is what
+    /// lets the engine accept copies that share a volume or physical device;
+    /// any other warning, such as an ASC MHL history mismatch, only asks to
+    /// be read.
+    let sameDeviceWarnings: [String]
     let notices: [String]
 
     var canStart: Bool { blockingIssues.isEmpty }
     var requiresAcknowledgement: Bool { !warnings.isEmpty }
+    /// Whether the operator's acknowledgement is also consent to copies that
+    /// are not independent of the source or of each other: only when an
+    /// independence warning is among what they acknowledged.
+    func allowsSameDevice(acknowledged: Bool) -> Bool {
+        acknowledged && !sameDeviceWarnings.isEmpty
+    }
 
     var requestDestinations: [TransferDestination] {
         destinations.map { TransferDestination(baseRoot: $0.base, outputRoot: $0.output) }
@@ -143,6 +154,7 @@ struct TransferPreflight: Sendable, Equatable {
             let folderName = validFolderName(rawName)
             var blocking: [String] = []
             var warnings: [String] = []
+            var sameDeviceWarnings: [String] = []
             var notices: [String] = []
             var items: [SourceItem] = []
             var sourceItemCount = 0
@@ -239,7 +251,8 @@ struct TransferPreflight: Sendable, Equatable {
                     || sourceCanonical.path.hasPrefix(canonicalOutput.path + "/") {
                     blocking.append("Source and output folders overlap: \(base.path)")
                 }
-                if fileSystem.fileExists(at: output) {
+                let outputExists = fileSystem.fileExists(at: output)
+                if outputExists {
                     duplicateManifest = verifiedDuplicateCandidate(
                         at: output,
                         sourceFingerprint: planFingerprint(items),
@@ -265,6 +278,20 @@ struct TransferPreflight: Sendable, Equatable {
                             + ". Nothing is ever overwritten, so those files would fail."
                         )
                     }
+                }
+                // An existing output the engine writes into (directly, or
+                // beside a verified duplicate) gets this offload's ASC MHL
+                // generation appended to whatever history it already holds.
+                if outputExists, layout == .directly || duplicateManifest != nil {
+                    let history = historyIssues(
+                        base: base,
+                        output: output,
+                        items: items,
+                        algorithm: algorithm,
+                        fileSystem: fileSystem
+                    )
+                    blocking.append(contentsOf: history.blocking)
+                    warnings.append(contentsOf: history.warnings)
                 }
 
                 let volume = try? fileSystem.volume(at: base)
@@ -302,7 +329,7 @@ struct TransferPreflight: Sendable, Equatable {
                             ? L10n.text("A camera-card source cannot also be its own destination volume.")
                             : L10n.text("A camera-card source cannot share its physical device with a destination."))
                     } else {
-                        warnings.append(sameVolume
+                        sameDeviceWarnings.append(sameVolume
                             ? L10n.format(
                                 "%@ is on the same volume as the source; this is not an independent backup.",
                                 base.lastPathComponent
@@ -330,10 +357,11 @@ struct TransferPreflight: Sendable, Equatable {
                 ))
             }
 
-            warnings.append(contentsOf: independenceWarnings(
+            sameDeviceWarnings.append(contentsOf: independenceWarnings(
                 source: (source.lastPathComponent, sourceVolume),
                 destinations: independenceEntries
             ))
+            warnings.append(contentsOf: sameDeviceWarnings)
 
             if layout == .directly, !reviewedDestinations.isEmpty {
                 notices.append(
@@ -358,6 +386,7 @@ struct TransferPreflight: Sendable, Equatable {
                 destinations: reviewedDestinations,
                 blockingIssues: Array(Set(blocking)).sorted(),
                 warnings: Array(Set(warnings)).sorted(),
+                sameDeviceWarnings: Array(Set(sameDeviceWarnings)).sorted(),
                 notices: Array(Set(notices)).sorted()
             )
         }.value
@@ -376,6 +405,122 @@ struct TransferPreflight: Sendable, Equatable {
             .map(\.relativePath)
             .prefix(20)
             .sorted()
+    }
+
+    /// What `output`'s ASC MHL history already says about the plan. The
+    /// engine appends its generation there only after every copy verified,
+    /// and refuses one the history contradicts, which fails a transfer whose
+    /// bytes all arrived. This loads the same history through the same
+    /// baseline before any byte moves, reading the whole chain as `append`
+    /// will, once per source. Nothing is hashed or written, so a conflict only
+    /// the digests can show, or a history folder this user cannot write to,
+    /// is still the engine's to refuse.
+    static func historyIssues(
+        base: URL,
+        output: URL,
+        items: [SourceItem],
+        algorithm: ChecksumAlgorithm,
+        fileSystem: any FileSystemAccess
+    ) -> (blocking: [String], warnings: [String]) {
+        // The folder whose history this is: the destination itself, or the
+        // transfer folder in it that holds a verified duplicate.
+        let name = output == base
+            ? base.lastPathComponent
+            : "\(base.lastPathComponent)/\(output.lastPathComponent)"
+        func unreadable(_ reason: String) -> (blocking: [String], warnings: [String]) {
+            ([L10n.format(
+                "The ASC MHL history in %@ cannot be read: %@. This offload could not add its MHL record there; choose another folder.",
+                name,
+                reason
+            )], [])
+        }
+        let history: MHLHistoryStore.History
+        do {
+            guard let loaded = try MHLHistoryStore.loadHistory(at: output, fileSystem: fileSystem) else {
+                return ([], [])
+            }
+            history = loaded
+        } catch MHLReadError.chainDigestMismatch(let path) {
+            return unreadable(L10n.format("%@ no longer matches the checksum its chain recorded", path))
+        } catch {
+            return unreadable(L10n.text("its chain or a generation is missing, unreadable, or malformed"))
+        }
+
+        let baseline = HistoryBaseline(history.records, algorithm: algorithm)
+        var differentFiles: [String] = []
+        var otherFormat: [String] = []
+        var recordedFormats: Set<ChecksumAlgorithm> = []
+        var probablyDifferent: [String] = []
+        for item in items {
+            switch baseline.prediction(for: item) {
+            case .differentFile:
+                differentFiles.append(item.relativePath)
+            case .otherFormat(let recorded):
+                otherFormat.append(item.relativePath)
+                recordedFormats.formUnion(recorded)
+            case .probablyDifferentFile:
+                probablyDifferent.append(item.relativePath)
+            case nil:
+                break
+            }
+        }
+
+        var blocking: [String] = []
+        var warnings: [String] = []
+        if !differentFiles.isEmpty {
+            blocking.append(L10n.format(
+                "The ASC MHL history in %@ already records a different file at %lld planned path(s): %@. This offload could not add its MHL record; choose a new folder.",
+                name,
+                Int64(differentFiles.count),
+                pathList(differentFiles)
+            ))
+        }
+        if !otherFormat.isEmpty {
+            // Switching to a type the folder holds helps only when, under the
+            // same baseline, it leaves no planned path in another format.
+            let fitting = recordedFormats.filter { format in
+                let other = HistoryBaseline(history.records, algorithm: format)
+                return items.allSatisfy {
+                    guard case .otherFormat = other.prediction(for: $0) else { return true }
+                    return false
+                }
+            }
+            func formats(_ set: Set<ChecksumAlgorithm>) -> String {
+                ListFormatter.localizedString(byJoining: set.map(\.displayName).sorted())
+            }
+            blocking.append(fitting.isEmpty
+                ? L10n.format(
+                    "The ASC MHL history in %@ already records %lld planned path(s) only under another checksum type, %@: %@. It mixes checksum types, so no single type matches every planned path. This offload could not add its MHL record; choose a new folder.",
+                    name,
+                    Int64(otherFormat.count),
+                    formats(recordedFormats),
+                    pathList(otherFormat)
+                )
+                : L10n.format(
+                    "The ASC MHL history in %@ already records %lld planned path(s) only under another checksum type, %@: %@. This offload could not add its MHL record; use the checksum type the folder already uses, or choose a new folder.",
+                    name,
+                    Int64(otherFormat.count),
+                    formats(fitting),
+                    pathList(otherFormat)
+                ))
+        }
+        if !probablyDifferent.isEmpty {
+            warnings.append(L10n.format(
+                "The ASC MHL history in %@ records %lld planned path(s) at the same size but a different modification time: %@. If the contents differ, this offload will fail when it writes its MHL record.",
+                name,
+                Int64(probablyDifferent.count),
+                pathList(probablyDifferent)
+            ))
+        }
+        return (blocking, warnings)
+    }
+
+    /// The first three paths, then how many more.
+    private static func pathList(_ paths: [String]) -> String {
+        let sorted = paths.sorted()
+        let named = sorted.prefix(3).joined(separator: ", ")
+        guard sorted.count > 3 else { return named }
+        return named + " " + L10n.format("…and %lld more", Int64(sorted.count - 3))
     }
 
     /// Destinations that are not independent of each other, and every

@@ -78,6 +78,8 @@ struct VolumeIndependenceTests {
         #expect(result.warnings.contains {
             $0.contains("Shuttle A and Shuttle B") && $0.contains("share one physical volume")
         })
+        #expect(result.allowsSameDevice(acknowledged: true))
+        #expect(!result.allowsSameDevice(acknowledged: false))
     }
 
     @Test func destinationOnTheSourcesPhysicalDeviceIsNotAnIndependentBackup() async throws {
@@ -91,6 +93,7 @@ struct VolumeIndependenceTests {
         #expect(result.canStart, "\(result.blockingIssues)")
         #expect(result.requiresAcknowledgement)
         #expect(result.warnings.contains { $0.contains("Shuttle A is on the same physical device as the source") })
+        #expect(result.allowsSameDevice(acknowledged: true))
         #expect(!result.warnings.contains { $0.contains("Shuttle B") })
     }
 

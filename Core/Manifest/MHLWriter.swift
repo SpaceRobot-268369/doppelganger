@@ -320,16 +320,40 @@ public enum MHLWriter {
 /// format, refuses the generation instead of recording "failed" or "new".
 /// A record marked "failed", or with an action ASC MHL does not define, holds
 /// a hash of bytes nothing vouches for and is no baseline.
-private struct HistoryBaseline {
+///
+/// `prediction(for:)` reads the same baseline before a planned file is
+/// hashed, so preflight can foresee what `action` will refuse.
+struct HistoryBaseline {
+    /// What the baseline foresees for a planned file from its size and
+    /// modification time alone.
+    enum Prediction: Equatable {
+        /// An original the history holds for the path only in `recorded`
+        /// formats, none of them this one, so `action` refuses any digest.
+        case otherFormat(recorded: Set<ChecksumAlgorithm>)
+        /// A hash in this format the file's digest cannot match: recorded for
+        /// a file of another size, contradicted by another hash for the path,
+        /// or not a digest this format's hasher produces.
+        case differentFile
+        /// The recorded size matches, but no recorded modification date is
+        /// within FAT's 2-second granularity of the file's: most likely
+        /// other bytes, which only the digest can tell.
+        case probablyDifferentFile
+    }
+
+    private let algorithm: ChecksumAlgorithm
     private var withOriginal: Set<String> = []
     private var digests: [String: Set<String>] = [:]
+    /// The trusted records themselves, by path, for `prediction(for:)`.
+    private var trusted: [String: [MHLDocument.Entry]] = [:]
 
     init(_ history: [MHLDocument.Entry], algorithm: ChecksumAlgorithm) {
+        self.algorithm = algorithm
         for entry in history where !entry.recordsUntrustedHash {
             if entry.recordsOriginalHash { withOriginal.insert(entry.relativePath) }
             if let digest = entry.digests[algorithm] {
                 digests[entry.relativePath, default: []].insert(digest.lowercased())
             }
+            trusted[entry.relativePath, default: []].append(entry)
         }
     }
 
@@ -343,6 +367,34 @@ private struct HistoryBaseline {
         guard withOriginal.contains(path) else { return "original" }
         guard !prior.isEmpty else { throw MHLHistoryError.conflictingHistory(path: path) }
         return "verified"
+    }
+
+    /// `nil` where `action` will accept the file, or where only the digest
+    /// can tell: a matching size and time, or a time missing on either side.
+    func prediction(for item: SourceItem) -> Prediction? {
+        let records = trusted[item.relativePath] ?? []
+        let prior = digests[item.relativePath] ?? []
+        guard !prior.isEmpty else {
+            guard withOriginal.contains(item.relativePath) else { return nil }
+            return .otherFormat(recorded: records.reduce(into: []) { $0.formUnion($1.digests.keys) })
+        }
+        // `action` needs every earlier hash to equal the new one, which two
+        // different hashes, or one no hasher writes, never can.
+        if prior.count > 1 || prior.contains(where: { !MHLWriter.isWellFormedDigest($0, algorithm: algorithm) }) {
+            return .differentFile
+        }
+        let hashed = records.filter { $0.digests[algorithm] != nil }
+        if hashed.contains(where: { $0.size != item.size }) { return .differentFile }
+        // Read back in the format `generation` writes `lastmodificationdate`.
+        guard let current = item.modificationTime else { return nil }
+        let iso = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        let elsewhere = hashed.allSatisfy { record in
+            guard let modifiedAt = record.modifiedAt,
+                  let recorded = try? Date(modifiedAt, strategy: iso)
+            else { return false }
+            return abs(recorded.timeIntervalSince1970 - current) > 2
+        }
+        return elsewhere ? .probablyDifferentFile : nil
     }
 }
 

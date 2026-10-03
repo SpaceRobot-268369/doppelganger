@@ -16,6 +16,45 @@ struct MHLWriteReceipt: Sendable {
 /// its previous bytes have been archived, and receipts make a multi-drive
 /// evidence write reversible until every destination succeeds.
 enum MHLHistoryStore {
+    /// A folder's ASC MHL history as `append` reads it.
+    struct History: Sendable {
+        /// The chain index's bytes, archived before `append` replaces it.
+        let chainData: Data
+        let chainEntries: [MHLWriter.ChainEntry]
+        /// File records of every generation the chain lists, oldest first.
+        let records: [MHLDocument.Entry]
+    }
+
+    /// Reads `destination`'s chain and every generation it lists, each
+    /// checked against its C4, or returns `nil` when the folder has no chain.
+    /// Writes nothing. `append` builds on exactly this read, so preflight
+    /// can load the history the engine will and foresee its refusals.
+    static func loadHistory(at destination: URL, fileSystem: any FileSystemAccess) throws -> History? {
+        let directory = destination.appendingPathComponent(MHLWriter.directoryName, isDirectory: true)
+        let chainURL = directory.appendingPathComponent(MHLWriter.chainFileName)
+        guard fileSystem.fileExists(at: chainURL) else { return nil }
+        let data = try MHLReader.readAll(chainURL, fileSystem: fileSystem)
+        let chain = try MHLReader.readChain(data)
+        var records: [MHLDocument.Entry] = []
+        for entry in chain.entries {
+            let generationData = try MHLReader.readAll(
+                directory.appendingPathComponent(entry.path),
+                fileSystem: fileSystem
+            )
+            guard C4Checksum.digest(generationData) == entry.c4 else {
+                throw MHLReadError.chainDigestMismatch(path: entry.path)
+            }
+            records += try MHLReader.read(generationData).entries
+        }
+        return History(
+            chainData: data,
+            chainEntries: chain.entries.map {
+                MHLWriter.ChainEntry(sequence: $0.sequence, path: $0.path, c4: $0.c4)
+            },
+            records: records
+        )
+    }
+
     /// `parent`, for a repair, is the failed attempt it retries: the pairs it
     /// verified at `destination` join the generation, so a folder's first
     /// history can describe every verified copy rather than only the repaired
@@ -30,30 +69,10 @@ enum MHLHistoryStore {
         guard report.status == .verified else { return nil }
         let directory = destination.appendingPathComponent(MHLWriter.directoryName, isDirectory: true)
         let chainURL = directory.appendingPathComponent(MHLWriter.chainFileName)
-        let previousChainData: Data?
-        let priorEntries: [MHLWriter.ChainEntry]
-        var history: [MHLDocument.Entry] = []
-        if fileSystem.fileExists(at: chainURL) {
-            let data = try MHLReader.readAll(chainURL, fileSystem: fileSystem)
-            let chain = try MHLReader.readChain(data)
-            for entry in chain.entries {
-                let generationData = try MHLReader.readAll(
-                    directory.appendingPathComponent(entry.path),
-                    fileSystem: fileSystem
-                )
-                guard C4Checksum.digest(generationData) == entry.c4 else {
-                    throw MHLReadError.chainDigestMismatch(path: entry.path)
-                }
-                history += try MHLReader.read(generationData).entries
-            }
-            previousChainData = data
-            priorEntries = chain.entries.map {
-                MHLWriter.ChainEntry(sequence: $0.sequence, path: $0.path, c4: $0.c4)
-            }
-        } else {
-            previousChainData = nil
-            priorEntries = []
-        }
+        let loaded = try loadHistory(at: destination, fileSystem: fileSystem)
+        let previousChainData = loaded?.chainData
+        let priorEntries = loaded?.chainEntries ?? []
+        let history = loaded?.records ?? []
 
         let sequence = (priorEntries.last?.sequence ?? 0) + 1
         let carried = try carriedRecords(
