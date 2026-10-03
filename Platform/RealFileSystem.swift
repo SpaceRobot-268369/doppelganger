@@ -202,8 +202,8 @@ public struct RealFileSystem: FileSystemAccess {
         try PosixReadStream(url: url, uncached: uncached)
     }
 
-    public func openForWritingExclusive(_ url: URL) throws -> any FileWriteStream {
-        try PosixWriteStream(url: url)
+    public func openForWritingExclusive(_ url: URL, durability: WriteDurability) throws -> any FileWriteStream {
+        try PosixWriteStream(url: url, durability: durability)
     }
 
     public func moveItemExclusive(from staging: URL, to final: URL) throws {

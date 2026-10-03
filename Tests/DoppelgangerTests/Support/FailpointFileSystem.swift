@@ -19,6 +19,8 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
     private var changedSourceSuffixes: Set<String> = []
     private var freeSpaceOverrides: [String: Int64] = [:]
     private var evidenceWriteFailureRoots: Set<String> = []
+    private var modificationTimeFailureSuffixes: Set<String> = []
+    private var durabilityByPath: [String: WriteDurability] = [:]  // logical target path → requested durability
     private var readDelayMicros: UInt32 = 0
     private var writeDelayMicros: UInt32 = 0
 
@@ -70,6 +72,19 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
 
     func failEvidenceWrites(under root: URL) {
         _ = withLock { evidenceWriteFailureRoots.insert(root.path) }
+    }
+
+    /// `setModificationTime` on any path with this suffix throws — the
+    /// exFAT/SMB mount that publishes bytes but refuses a timestamp.
+    func failModificationTime(pathSuffix: String) {
+        _ = withLock { modificationTimeFailureSuffixes.insert(pathSuffix) }
+    }
+
+    /// The `WriteDurability` the engine asked for when it opened the file
+    /// that eventually published at `url` (staging names are folded back to
+    /// their logical target), or `nil` if it was never opened.
+    func requestedDurability(for url: URL) -> WriteDurability? {
+        withLock { durabilityByPath[url.path] }
     }
 
     /// Slow every chunk down so cancellation tests have a deterministic
@@ -125,10 +140,11 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
         return FailpointReadStream(base: try base.openForReading(url, uncached: uncached), path: path, owner: self)
     }
 
-    func openForWritingExclusive(_ url: URL) throws -> any FileWriteStream {
+    func openForWritingExclusive(_ url: URL, durability: WriteDurability) throws -> any FileWriteStream {
         let path = url.path
         if isGone(path) { throw FileSystemError.volumeGone }
         let logicalPath = logicalTargetPath(for: path)
+        withLock { durabilityByPath[logicalPath] = durability }
         if withLock({ evidenceWriteFailureRoots.contains { covered(path, by: $0) } }),
            URL(fileURLWithPath: logicalPath).lastPathComponent.hasPrefix("doppelganger-") {
             throw FileSystemError.noSpace
@@ -143,7 +159,7 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
             return false
         }
         return FailpointWriteStream(
-            base: try base.openForWritingExclusive(url),
+            base: try base.openForWritingExclusive(url, durability: durability),
             path: path,
             owner: self,
             corruptFirstByte: corrupt
@@ -162,6 +178,9 @@ final class FailpointFileSystem: FileSystemAccess, @unchecked Sendable {
 
     func setModificationTime(_ timeIntervalSince1970: TimeInterval, at url: URL) throws {
         if isGone(url.path) { throw FileSystemError.volumeGone }
+        if withLock({ modificationTimeFailureSuffixes.contains { url.path.hasSuffix($0) } }) {
+            throw FileSystemError.other(code: EPERM, detail: "\(url.path): injected timestamp refusal")
+        }
         try base.setModificationTime(timeIntervalSince1970, at: url)
     }
 

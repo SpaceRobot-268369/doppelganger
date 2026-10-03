@@ -79,15 +79,22 @@ final class PosixReadStream: FileReadStream {
 final class PosixWriteStream: FileWriteStream {
     private var descriptor: Int32
     private let path: String
+    private let durability: WriteDurability
 
     /// Exclusive create: an existing file at `url` throws
     /// `FileSystemError.alreadyExists` rather than being overwritten.
-    init(url: URL) throws {
+    init(url: URL, durability: WriteDurability = .standard) throws {
         path = url.path
+        self.durability = durability
         descriptor = Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
         guard descriptor >= 0 else {
             throw IOContext.writing.map(errno, path: path)
         }
+        // Keep freshly written pages out of the unified buffer cache so the
+        // verify pass's uncached read-back cannot be satisfied from memory —
+        // it must come from the destination device. Best effort: a
+        // filesystem that refuses the hint still gets correct bytes.
+        _ = fcntl(descriptor, F_NOCACHE, 1)
     }
 
     func write(_ buffer: [UInt8], count: Int) throws {
@@ -112,13 +119,27 @@ final class PosixWriteStream: FileWriteStream {
         guard descriptor >= 0 else { return }
         let fd = descriptor
         descriptor = -1
-        if fsync(fd) != 0 {
+        if !Self.flush(fd, durability: durability) {
             let code = errno
             _ = Darwin.close(fd)
             throw IOContext.writing.map(code, path: path)
         }
         if Darwin.close(fd) != 0 {
             throw IOContext.writing.map(errno, path: path)
+        }
+    }
+
+    /// `fsync(2)` flushes the kernel's buffers; `F_FULLFSYNC` additionally
+    /// asks the drive to commit its own write cache. Not every filesystem
+    /// implements the latter (network and some external volumes return
+    /// ENOTSUP), so `.full` falls back to a plain `fsync` when refused.
+    private static func flush(_ fd: Int32, durability: WriteDurability) -> Bool {
+        switch durability {
+        case .standard:
+            return fsync(fd) == 0
+        case .full:
+            if fcntl(fd, F_FULLFSYNC) == 0 { return true }
+            return fsync(fd) == 0
         }
     }
 
