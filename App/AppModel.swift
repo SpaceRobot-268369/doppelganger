@@ -176,8 +176,11 @@ final class AppModel {
     private(set) var sessions: [TransferSession] = []
     /// Linked resume/repair attempts already created from each attempt, so a
     /// second click, or a card restored after relaunch, cannot start a
-    /// duplicate. Observed by the card's action row.
-    private(set) var continuations = AttemptContinuations()
+    /// duplicate. Observed by the card's action row. Every claim and release
+    /// is mirrored onto the cards' `continuedInLinkedAttempt`.
+    private(set) var continuations = AttemptContinuations() {
+        didSet { markContinuedAttempts() }
+    }
     var section: SidebarSection = .transfers
     var filter: TransferFilter = .all
     /// New Offload is a secondary page over the detail area, not a modal.
@@ -1265,6 +1268,19 @@ final class AppModel {
 
     func continuation(of attemptID: UUID) -> ContinuationAvailability {
         continuations.availability(of: attemptID)
+    }
+
+    /// The only writer of `TransferSession.continuedInLinkedAttempt`. A card
+    /// stops promising Resume while a linked attempt holds any of its
+    /// destinations, and promises it again once that claim is released: the
+    /// child was withdrawn, or stopped before it reached a destination.
+    private func markContinuedAttempts() {
+        for session in sessions {
+            let continued = continuation(of: session.id) != .open
+            if session.continuedInLinkedAttempt != continued {
+                session.continuedInLinkedAttempt = continued
+            }
+        }
     }
 
     /// Failed pairs a repair could still claim from this attempt's card.

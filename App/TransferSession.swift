@@ -421,12 +421,21 @@ final class TransferSession: Identifiable {
         return destinationBases[index]
     }
 
-    /// Queue resources are volume identifiers, not folder paths.
+    /// Queue resources are volume identifiers, not folder paths, plus the
+    /// physical device behind each volume when it is known
+    /// (`FileSystemVolume.physicalDeviceIdentifier`, valid for this boot and
+    /// never persisted). Two APFS volumes or partitions on one disk, or two
+    /// shares from one server, are one device, so the queue never runs two
+    /// transfers on it side by side.
     var resourceIDs: Set<String> {
         let fileSystem = RealFileSystem()
-        return Set(([source] + destinationBases).compactMap {
-            try? fileSystem.volume(at: $0).identifier
-        })
+        return Self.queueResources(
+            of: ([source] + destinationBases).compactMap { try? fileSystem.volume(at: $0) }
+        )
+    }
+
+    nonisolated static func queueResources(of volumes: [FileSystemVolume]) -> Set<String> {
+        Set(volumes.flatMap { [$0.identifier] + [$0.physicalDeviceIdentifier].compactMap { $0 } })
     }
 
     // MARK: - Lifecycle
